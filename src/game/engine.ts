@@ -1,1777 +1,1000 @@
-import { Sfx } from './audio';
+/**
+ * GameEngine – die komplette Spielsimulation (ohne DOM, daher headless testbar).
+ *
+ * Die Engine koordiniert die Subsysteme:
+ *  economy.ts (Wirtschafts-API, Hub-Lager als einzige Wahrheit) · storage.ts (lokale Lager/Reservierungen)
+ *  logistics.ts (Transportaufträge) · pathing.ts (Wegfindung, Zugänge) · residents.ts (Einwohner)
+ *  jobs.ts (Forst/Farm/Bergbau/Verarbeitung) · construction.ts (Baustellen, Bauarbeiter).
+ *
+ * Simulation in festen Schritten (SIM_STEP); `update(dt)` wird vom Renderer pro Frame aufgerufen.
+ */
+import {
+  BUILDINGS, JOBS, JOB_IDS, QUESTS, RESOURCES, RES_IDS, T, TECHS, UPGRADE_LEVELS, xpToNext,
+  LEVEL_UNLOCKS, MAP_SIZE, STATUS_TEXT,
+  type BStatus, type BuildingDef, type BuildingId, type JobId, type QuestDef, type ResAmounts, type ResId,
+} from "./data";
+import { CONSTRUCTION, PHYSICAL_TYPES, PROCESSORS, POPULATION, TRANSPORT, constructionMaterials } from "./config";
+import { generateMap, type MapData } from "./mapgen";
+import {
+  ACTIVE_STATUSES, type FieldState, type PathResult, type PhysicalBuildingState, type Resident, type ResidentState, type TransportOrder,
+} from "./physical";
+import {
+  amountOf, getCapacity, getAvailableInputCapacity, getStored, isHub, newPhysicalState, totalStored,
+} from "./storage";
+import {
+  canAfford, consumeCost, consumeResource, depositCost, depositResource, getEconomyTotal, getResourceCapacity,
+  getSpendableResource, getTotalResource, setHubStock, syncRes,
+} from "./economy";
+import { accessTiles, buildingAccess, isRoadTile, roadAccess } from "./pathing";
+import {
+  cancelOrder, logisticsSummary, onBuildingRemoved, planTransports, rebuildReservations, updateOrders,
+} from "./logistics";
+import { assignHomes, assignWorkplaces, releaseResident, syncPopulation, updateResidents } from "./residents";
+import { depositInfo, initDeposits, initialDeposit, updateFields, updateProcessors, updateTrees, treeStage } from "./jobs";
+import { isInstant, materialFraction, siteState, updateConstruction } from "./construction";
 
-export const W = 480;
-export const H = 720;
+const SIM_STEP = 0.5;
+const SOLDIERS_PER_BARRACKS = 10;
+export const SAVE_VERSION = 4;
 
-export type GameState = 'menu' | 'playing' | 'paused' | 'over';
-export type Difficulty = 'easy' | 'normal' | 'hard';
-
-export interface DifficultyCfg {
-  label: string;
-  hp: number;
-  fire: number;
-  speed: number;
-  score: number;
-  dmg: number;
-}
-
-export const DIFFICULTIES: Record<Difficulty, DifficultyCfg> = {
-  easy: { label: 'Kadett', hp: 0.8, fire: 0.75, speed: 0.88, score: 0.8, dmg: 0.7 },
-  normal: { label: 'Pilot', hp: 1, fire: 1, speed: 1, score: 1, dmg: 1 },
-  hard: { label: 'Veteran', hp: 1.35, fire: 1.35, speed: 1.15, score: 1.6, dmg: 1.35 },
-};
-
-export interface GameOverInfo {
-  score: number;
-  wave: number;
-  kills: number;
-  time: number;
-  best: number;
-  isRecord: boolean;
-  difficulty: Difficulty;
-  bosses: number;
-}
-
-export interface Callbacks {
-  onState: (s: GameState) => void;
-  onGameOver: (info: GameOverInfo) => void;
-  onMute: (m: boolean) => void;
-}
-
-type EnemyKind = 'scout' | 'zig' | 'tank' | 'kamikaze' | 'shooter' | 'boss';
-type PickupKind = 'power' | 'shield' | 'health' | 'bomb';
-
-interface Player {
+export interface Building {
+  id: number;
+  type: BuildingId;
   x: number;
   y: number;
-  hp: number;
-  maxHp: number;
-  weapon: number;
-  shield: number;
-  invuln: number;
-  bombs: number;
-  fireCd: number;
-  alive: boolean;
-  hit: number;
+  /** Baufortschritt 0..1 */
+  progress: number;
+  built: boolean;
+  /* --- abgeleitet (nicht gespeichert) --- */
+  status: BStatus;
+  workers: number;
+  /** Besetzte Stellen je Beruf (aus computeStats) */
+  crew: Partial<Record<JobId, number>>;
+  connected: boolean;
+  site: number;
+  eff: number;
+  mineRes: ResId | null;
+  missing: ResId | null;
+  /** Lokale Lager, Produktionszustand – auch Baumaterial-Lager von Baustellen */
+  physical?: PhysicalBuildingState;
+  field?: FieldState;
+  rotation: 0 | 1 | 2 | 3;
+  siteState?: string;
 }
 
-interface Bullet {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  r: number;
-  dmg: number;
-  friendly: boolean;
-  color: string;
-  dead: boolean;
+export interface Toast { id: number; text: string; kind: "info" | "good" | "warn" | "level"; t: number }
+export interface PlaceCheck { ok: boolean; reason: string | null; site: number | null; mineRes: ResId | null }
+export interface Ghost { x: number; y: number; check: PlaceCheck }
+export interface Bottleneck { sev: "bad" | "warn"; text: string }
+
+export interface SaveData {
+  v: number;
+  seed: number;
+  buildings: { i?: number; t: BuildingId; x: number; y: number; p: number; r?: 0 | 1 | 2 | 3 }[];
+  res: Record<string, number>;
+  xp: number; level: number; pop: number; soldiers: number; playTime: number;
+  research: { done: string[]; active: { id: string; remaining: number } | null };
+  questsDone: string[];
+  tradeCount: number;
+  residents?: Resident[];
+  transportOrders?: TransportOrder[];
+  localStorage?: Record<string, Partial<PhysicalBuildingState>>;
+  harvestedTrees?: number[];
+  treeGrowth?: Record<string, number>;
+  treeEmpty?: Record<string, number>;
+  reservedTrees?: Record<string, number>;
+  fieldStates?: Record<string, FieldState>;
+  depositRemaining?: Record<string, number>;
+  transportStats?: { delivered: number; cancelled: number; failed: number; goods: number };
+  lostGoods?: Record<string, number>;
 }
 
-interface Enemy {
-  kind: EnemyKind;
-  x: number;
-  y: number;
-  baseX: number;
-  vx: number;
-  vy: number;
-  r: number;
-  hp: number;
-  maxHp: number;
-  t: number;
-  cd: number;
-  cd2: number;
-  cd3: number;
-  score: number;
-  flash: number;
-  dir: number;
-  angle: number;
-  phase: number;
-  bossType: number;
-  entered: boolean;
-  dead: boolean;
-}
+type ResMap = Record<ResId, number>;
+const zeroRes = (): ResMap => Object.fromEntries(RES_IDS.map((r) => [r, 0])) as ResMap;
+const RESIDENT_STATES: ResidentState[] = ["AT_HOME", "RETURNING_HOME", "WALKING_TO_WORK", "WORKING", "WAITING", "FETCHING_RESOURCE", "TRANSPORTING", "DELIVERING_RESOURCE", "CONSTRUCTION_WORK"];
+type Rot = 0 | 1 | 2 | 3;
 
-interface Pickup {
-  kind: PickupKind;
-  x: number;
-  y: number;
-  t: number;
-}
+export class GameEngine {
+  map: MapData;
+  seed: number;
+  buildings: Building[] = [];
+  /** Belegung: Gebäude-ID je Kachel (0 = frei) – enthält die echten, gedrehten Footprints */
+  occ: Int32Array;
+  /** 1 = gebaute Straße */
+  roadGrid: Uint8Array;
+  private roadReach: Uint8Array;
+  private byId = new Map<number, Building>();
+  private residentById = new Map<number, Resident>();
+  private workerIndex = new Map<number, Resident[]>();
+  nextId = 1;
 
-interface Particle {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  life: number;
-  max: number;
-  size: number;
-  color: string;
-  glow: boolean;
-}
+  /** Wegenetz-Version: steigt bei jeder Strukturänderung (invalidiert Pfad-Cache, weckt blockierte Aufträge) */
+  pathVersion = 0;
+  pathCache: { version: number; map: Map<string, PathResult> } = { version: -1, map: new Map() };
 
-interface Ring {
-  x: number;
-  y: number;
-  r: number;
-  max: number;
-  life: number;
-  max_life: number;
-  color: string;
-  width: number;
-}
+  /** Abgeleiteter HUD-Cache (Summe der Hub-Lager). NICHT unabhängig veränderbar – siehe economy.ts */
+  resCache: ResMap = zeroRes();
+  get res(): Readonly<ResMap> { return this.resCache; }
+  hubs: Building[] = [];
 
-interface FloatText {
-  x: number;
-  y: number;
-  text: string;
-  life: number;
-  color: string;
-  size: number;
-}
+  xp = 0;
+  level = 1;
+  pop = 8;
+  soldiers = 0;
+  playTime = 0;
+  research: { done: string[]; active: { id: string; remaining: number } | null } = { done: [], active: null };
+  questsDone: string[] = [];
+  tradeCount = 0;
 
-interface Spawn {
-  t: number;
-  kind: EnemyKind;
-  x: number;
-  dir?: number;
-}
+  /* --- abgeleitete Werte --- */
+  limit: ResMap = zeroRes();
+  prod: ResMap = zeroRes();
+  cons: ResMap = zeroRes();
+  popCap = 0;
+  workforce = 0;
+  byJob = Object.fromEntries(JOB_IDS.map((j) => [j, { needed: 0, filled: 0 }])) as Record<JobId, { needed: number; filled: number }>;
+  foodStatus: "ok" | "low" | "starving" = "ok";
+  growthPerMin = 0;
+  military = 0;
 
-interface Banner {
-  text: string;
-  sub: string;
-  t: number;
-  max: number;
-  color: string;
-}
+  /* --- UI-Zustand --- */
+  ui: { buildType: BuildingId | null; selectedId: number | null; ghost: Ghost | null; buildRotation: Rot } = {
+    buildType: null, selectedId: null, ghost: null, buildRotation: 0,
+  };
+  toasts: Toast[] = [];
+  version = 0;
+  dirtyFlag = true;
 
-interface Star {
-  x: number;
-  y: number;
-  z: number;
-  tw: number;
-}
-
-const BOSS_NAMES = ['WÄCHTER', 'HYDRA', 'DREADNOUGHT'];
-const BEST_KEY = 'novastrike.best.v1';
-
-const rand = (a: number, b: number) => a + Math.random() * (b - a);
-const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
-
-export class Game {
-  state: GameState = 'menu';
-  diffKey: Difficulty = 'normal';
-  best = 0;
-
-  private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
-  private cb: Callbacks;
-  private sfx = new Sfx();
-  private raf = 0;
-  private lastT = 0;
-  private alive = true;
-  private keys = new Set<string>();
-  private pointer = { active: false, sx: 0, sy: 0 };
-  private nebula: HTMLCanvasElement;
-  private nebulaY = 0;
-  private stars: Star[] = [];
+  private listeners = new Set<() => void>();
+  private acc = 0;
+  private notifyAcc = 0;
+  private toastId = 1;
+  flowProd = zeroRes();
+  flowCons = zeroRes();
   private clock = 0;
+  physicalClock = 0;
+  simulationSpeed: 0 | 1 | 2 = 1;
 
-  private diff: DifficultyCfg = DIFFICULTIES.normal;
-  private p!: Player;
-  private bullets: Bullet[] = [];
-  private enemies: Enemy[] = [];
-  private pickups: Pickup[] = [];
-  private parts: Particle[] = [];
-  private rings: Ring[] = [];
-  private texts: FloatText[] = [];
-  private queue: Spawn[] = [];
-  private banner: Banner | null = null;
+  residents: Resident[] = [];
+  nextResidentId = 1;
+  transportOrders: TransportOrder[] = [];
+  transportArchive: TransportOrder[] = [];
+  nextTransportId = 1;
+  transportStats = { delivered: 0, cancelled: 0, failed: 0, goods: 0 };
+  /** Ware, die bei Recovery nirgends untergebracht werden konnte (wird nie still vernichtet) */
+  lostGoods: Partial<Record<ResId, number>> = {};
 
-  private score = 0;
-  private wave = 0;
-  private kills = 0;
-  private bosses = 0;
-  private time = 0;
-  private combo = 0;
-  private comboT = 0;
-  private waveT = 0;
-  private waveDelay = -1;
-  private shake = 0;
-  private flash = 0;
-  private deathT = 0;
-  private bossRef: Enemy | null = null;
+  /** Baumzustand: nur nicht-ausgewachsene Kacheln (0 = abgeholzt, 1..3 wachsend); fehlt = ausgewachsen */
+  treeGrowth = new Map<number, number>();
+  treeEmpty = new Map<number, number>();
+  reservedTrees = new Map<number, number>();
+  /** Terrain-Chunks (Schlüssel cy*100+cx), die der Renderer neu backen muss (Baum gefällt/nachgewachsen) */
+  treeDirtyChunks = new Set<number>();
+  markTreeDirty(i: number) { this.treeDirtyChunks.add(Math.floor(Math.floor(i / MAP_SIZE) / 8) * 100 + Math.floor((i % MAP_SIZE) / 8)); }
+  depositRemaining = new Map<number, number>();
 
-  constructor(canvas: HTMLCanvasElement, cb: Callbacks) {
-    this.canvas = canvas;
-    this.cb = cb;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas nicht verfügbar');
-    this.ctx = ctx;
-    try {
-      this.best = Number(localStorage.getItem(BEST_KEY)) || 0;
-    } catch {
-      this.best = 0;
-    }
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    this.nebula = this.buildNebula();
-    for (let i = 0; i < 100; i++) this.stars.push({ x: rand(0, W), y: rand(0, H), z: rand(0.15, 1), tw: rand(0, 6) });
-    this.resetWorld();
-
-    window.addEventListener('keydown', this.onKeyDown);
-    window.addEventListener('keyup', this.onKeyUp);
-    window.addEventListener('blur', this.onBlur);
-    document.addEventListener('visibilitychange', this.onBlur);
-    canvas.addEventListener('pointerdown', this.onPointerDown);
-    canvas.addEventListener('pointermove', this.onPointerMove);
-    canvas.addEventListener('pointerup', this.onPointerUp);
-    canvas.addEventListener('pointercancel', this.onPointerUp);
-
-    this.lastT = performance.now();
-    this.raf = requestAnimationFrame(this.loop);
+  private constructor(seed: number) {
+    this.seed = seed;
+    this.map = generateMap(seed);
+    this.occ = new Int32Array(MAP_SIZE * MAP_SIZE);
+    this.roadGrid = new Uint8Array(MAP_SIZE * MAP_SIZE);
+    this.roadReach = new Uint8Array(MAP_SIZE * MAP_SIZE);
+    initDeposits(this);
   }
 
-  destroy() {
-    this.alive = false;
-    cancelAnimationFrame(this.raf);
-    window.removeEventListener('keydown', this.onKeyDown);
-    window.removeEventListener('keyup', this.onKeyUp);
-    window.removeEventListener('blur', this.onBlur);
-    document.removeEventListener('visibilitychange', this.onBlur);
-    this.canvas.removeEventListener('pointerdown', this.onPointerDown);
-    this.canvas.removeEventListener('pointermove', this.onPointerMove);
-    this.canvas.removeEventListener('pointerup', this.onPointerUp);
-    this.canvas.removeEventListener('pointercancel', this.onPointerUp);
+  /* ================================================================ Erzeugen */
+
+  /** Neues Spiel: kleine Siedlung mit Lagerhaus, Straße und zwei Häusern (Eingang zur Straße gedreht) */
+  static newGame(seed: number): GameEngine {
+    const g = new GameEngine(seed);
+    const c = MAP_SIZE / 2;
+    g.addBuilding("warehouse", c - 1, c - 2, true);
+    for (let x = c - 3; x <= c + 4; x++) g.addBuilding("road", x, c + 1, true);
+    g.addBuilding("house_s", c - 2, c + 2, true, 2);
+    g.addBuilding("house_s", c, c + 2, true, 2);
+    g.pop = 8;
+    g.recompute();
+    depositResource(g, "holz", 150); depositResource(g, "stein", 80); depositResource(g, "bretter", 20);
+    depositResource(g, "getreide", 150); depositResource(g, "brot", 50); depositResource(g, "gold", 50);
+    syncPopulation(g);
+    g.computeStats();
+    return g;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Öffentliche Steuerung                                               */
-  /* ------------------------------------------------------------------ */
+  /** Spielstand laden (validiert; ältere Versionen werden migriert) */
+  static load(data: SaveData): GameEngine {
+    const g = new GameEngine(Math.floor(Number(data.seed)) || 1);
+    const legacy = !(Number(data.v) >= SAVE_VERSION);
+    const num = (v: unknown, d: number) => (typeof v === "number" && isFinite(v) ? v : d);
+    const tileOk = (i: number) => Number.isInteger(i) && i >= 0 && i < MAP_SIZE * MAP_SIZE;
+    g.xp = Math.max(0, num(data.xp, 0));
+    g.level = Math.max(1, Math.floor(num(data.level, 1)));
+    g.pop = Math.max(0, num(data.pop, 0));
+    g.soldiers = Math.max(0, num(data.soldiers, 0));
+    g.playTime = Math.max(0, num(data.playTime, 0));
+    g.tradeCount = Math.max(0, Math.floor(num(data.tradeCount, 0)));
+    if (data.treeGrowth && typeof data.treeGrowth === "object") for (const [k, v] of Object.entries(data.treeGrowth)) { const i = Number(k), n = Number(v); if (tileOk(i) && Number.isFinite(n)) g.treeGrowth.set(i, Math.max(0, Math.min(3, n))); }
+    if (Array.isArray(data.harvestedTrees)) for (const i of data.harvestedTrees) if (tileOk(i) && !g.treeGrowth.has(i)) g.treeGrowth.set(i, 0);
+    if (data.treeEmpty && typeof data.treeEmpty === "object") for (const [k, v] of Object.entries(data.treeEmpty)) { const i = Number(k), n = Number(v); if (tileOk(i) && Number.isFinite(n) && g.treeGrowth.get(i) === 0) g.treeEmpty.set(i, Math.max(0, n)); }
+    if (data.depositRemaining && typeof data.depositRemaining === "object") for (const [k, v] of Object.entries(data.depositRemaining)) { const i = Number(k), n = Number(v); if (tileOk(i) && Number.isFinite(n)) g.depositRemaining.set(i, Math.max(0, n)); }
+    g.questsDone = Array.isArray(data.questsDone) ? data.questsDone.filter((x) => QUESTS.some((q) => q.id === x)) : [];
+    const done = Array.isArray(data.research?.done) ? data.research.done.filter((id) => TECHS.some((t) => t.id === id)) : [];
+    const act = data.research?.active;
+    g.research = { done, active: act && TECHS.some((t) => t.id === act.id) ? { id: act.id, remaining: Math.max(0, num(act.remaining, 1)) } : null };
 
-  start(d: Difficulty) {
-    this.sfx.unlock();
-    this.diffKey = d;
-    this.diff = DIFFICULTIES[d];
-    this.resetWorld();
-    this.state = 'playing';
-    this.sfx.start();
-    this.startWave(1);
-    this.cb.onState(this.state);
-  }
-
-  toMenu() {
-    this.resetWorld();
-    this.state = 'menu';
-    this.cb.onState(this.state);
-  }
-
-  pause() {
-    if (this.state !== 'playing' || !this.p.alive) return;
-    this.state = 'paused';
-    this.keys.clear();
-    this.cb.onState(this.state);
-  }
-
-  resume() {
-    if (this.state !== 'paused') return;
-    this.state = 'playing';
-    this.lastT = performance.now();
-    this.cb.onState(this.state);
-  }
-
-  togglePause() {
-    if (this.state === 'playing') this.pause();
-    else if (this.state === 'paused') this.resume();
-  }
-
-  toggleMute() {
-    this.sfx.unlock();
-    this.sfx.setMuted(!this.sfx.muted);
-    this.cb.onMute(this.sfx.muted);
-  }
-
-  bomb() {
-    if (this.state !== 'playing' || !this.p.alive || this.p.bombs <= 0) return;
-    const p = this.p;
-    p.bombs--;
-    this.flash = 1;
-    this.shake = Math.max(this.shake, 14);
-    p.invuln = Math.max(p.invuln, 1);
-    this.sfx.bomb();
-    this.rings.push({ x: p.x, y: p.y, r: 10, max: 620, life: 0.7, max_life: 0.7, color: '#ffd166', width: 8 });
-    this.rings.push({ x: p.x, y: p.y, r: 10, max: 480, life: 0.55, max_life: 0.55, color: '#ff6b6b', width: 5 });
-    for (const b of this.bullets) {
-      if (!b.friendly && !b.dead) {
-        b.dead = true;
-        this.spark(b.x, b.y, '#ffe29a', 3, 60);
-        this.score += 5;
+    // Gebäude (IDs bleiben erhalten, damit Einwohner/Aufträge/Lager ihre Bezüge behalten)
+    const idMap = new Map<number, number>();
+    let seq = 0;
+    for (const b of Array.isArray(data.buildings) ? data.buildings : []) {
+      seq++;
+      if (!b || !BUILDINGS[b.t]) continue;
+      const rotation: Rot = b.r === 1 || b.r === 2 || b.r === 3 ? b.r : 0;
+      if (!g.terrainFree(b.t, Math.floor(b.x), Math.floor(b.y), rotation)) continue;
+      const nb = g.addBuilding(b.t, Math.floor(b.x), Math.floor(b.y), num(b.p, 1) >= 1, rotation);
+      if (!nb) continue;
+      idMap.set(Number.isInteger(b.i) ? (b.i as number) : seq, nb.id);
+      if (!nb.built) {
+        nb.progress = Math.max(0, Math.min(0.99, num(b.p, 0)));
+        if (legacy && nb.physical) { for (const [r, n] of Object.entries(constructionMaterials(nb.type)) as [ResId, number][]) nb.physical.input[r] = n; } // früher bereits bezahlt
       }
     }
-    for (const e of this.enemies) {
-      if (!e.dead) this.hitEnemy(e, e.kind === 'boss' ? 30 : 40, true);
+    g.recompute();
+
+    // Lager
+    const saved = data.localStorage && typeof data.localStorage === "object" ? data.localStorage : {};
+    for (const [oldId, st] of Object.entries(saved)) {
+      const b = g.getBuilding(idMap.get(Number(oldId)) ?? -1);
+      if (!b?.physical || !st || typeof st !== "object") continue;
+      if (legacy && (BUILDINGS[b.type].hub || !b.built)) continue;
+      const clean = (s: unknown) => { const o: Partial<Record<ResId, number>> = {}; if (s && typeof s === "object") for (const r of RES_IDS) { const n = Number((s as Record<string, unknown>)[r]); if (Number.isFinite(n) && n > 0) o[r] = n; } return o; };
+      b.physical.input = clean(st.input); b.physical.output = clean(st.output);
+      if (Number.isFinite(st.productionProgress)) b.physical.productionProgress = Math.max(0, Math.min(1, Number(st.productionProgress)));
+      if (st.level === 1 || st.level === 2 || st.level === 3) b.physical.level = st.level;
+      if (Number.isFinite(st.lastOutputAt)) b.physical.lastOutputAt = 0;
     }
+    if (legacy) { g.recompute(); setHubStock(g, Object.fromEntries(RES_IDS.map((r) => [r, Math.max(0, num(data.res?.[r], 0))]))); }
+    for (const b of g.buildings) if (b.physical) b.physical.rotation = b.rotation;
+    if (data.fieldStates && typeof data.fieldStates === "object") for (const [oldId, f] of Object.entries(data.fieldStates)) {
+      const b = g.getBuilding(idMap.get(Number(oldId)) ?? -1);
+      if (!b?.field || !f) continue;
+      const stages = ["EMPTY", "PLOWED", "SOWN", "GROWING", "RIPE", "HARVESTING", "HARVESTED"];
+      const stage = stages.includes(f.stage) ? f.stage : "EMPTY";
+      b.field = { ...b.field, stage: (stage === "HARVESTING" ? "RIPE" : stage) as FieldState["stage"], progress: Math.max(0, Math.min(1, Number(f.progress) || 0)), farmerId: null, yieldAmount: Math.max(1, Number(f.yieldAmount) || 4) };
+    }
+
+    // Einwohner & Transporte (erst ab v4 – ältere Saves enthielten erfundene Träger)
+    if (!legacy) {
+      if (Array.isArray(data.residents)) {
+        for (const r of data.residents) {
+          if (!r || !Number.isFinite(r.id) || !Number.isFinite(r.x) || !Number.isFinite(r.y) || g.residentById.has(r.id)) continue;
+          const wp = r.workplaceId !== null && r.workplaceId !== undefined ? idMap.get(r.workplaceId) ?? null : null;
+          const home = r.homeBuildingId !== null && r.homeBuildingId !== undefined ? idMap.get(r.homeBuildingId) ?? null : null;
+          const carrying = r.carrying && RES_IDS.includes(r.carrying.resource) && Number(r.carrying.amount) > 0 ? { resource: r.carrying.resource, amount: Number(r.carrying.amount) } : null;
+          const isC = r.job === "traeger";
+          g.addResident({
+            id: Math.floor(r.id), x: r.x, y: r.y, homeBuildingId: home, job: typeof r.job === "string" ? r.job : "unassigned", workplaceId: wp,
+            state: carrying && !isC ? "DELIVERING_RESOURCE" : RESIDENT_STATES.includes(r.state) ? (isC && r.orderId !== null ? r.state : "WAITING") : "WAITING",
+            targetX: r.x, targetY: r.y, speed: Math.max(0.5, Math.min(6, num(r.speed, 2.2))), path: [], pathIndex: 0, carrying,
+            workTimer: 0, animation: 0, workTargetId: null, orderId: isC && Number.isInteger(r.orderId) ? r.orderId : null, atWork: false,
+          });
+        }
+        g.nextResidentId = Math.max(1, ...g.residents.map((r) => r.id + 1));
+      }
+      if (Array.isArray(data.transportOrders)) {
+        for (const o of data.transportOrders) {
+          if (!o || !Number.isFinite(o.id) || !RES_IDS.includes(o.resource) || !(ACTIVE_STATUSES as string[]).includes(o.status)) continue;
+          const s = o.sourceBuildingId !== null ? idMap.get(o.sourceBuildingId as number) ?? null : null, t = o.targetBuildingId !== null ? idMap.get(o.targetBuildingId as number) ?? null : null;
+          g.transportOrders.push({ ...o, amount: Math.max(0, Number(o.amount) || 0), sourceBuildingId: s, targetBuildingId: t, waited: Math.max(0, Number(o.waited) || 0), blockedFor: 0, routeVersion: -1 });
+        }
+        g.nextTransportId = Math.max(1, ...g.transportOrders.map((o) => o.id + 1));
+      }
+      if (data.transportStats && typeof data.transportStats === "object") for (const k of ["delivered", "cancelled", "failed", "goods"] as const) g.transportStats[k] = Math.max(0, num(data.transportStats[k], 0));
+      for (const r of g.residents) { const o = r.orderId !== null ? g.transportOrders.find((x) => x.id === r.orderId && x.carrierId === r.id) : undefined; if (!o) { r.orderId = null; } else r.atWork = true; }
+      for (const o of g.transportOrders) if (o.carrierId !== null && g.getResident(o.carrierId)?.orderId !== o.id) o.carrierId = null;
+      rebuildReservations(g);
+    }
+    g.recompute(); g.computeStats(); syncRes(g);
+    return g;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Eingabe                                                             */
-  /* ------------------------------------------------------------------ */
-
-  private onKeyDown = (e: KeyboardEvent) => {
-    const c = e.code;
-    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(c) && this.state === 'playing') {
-      e.preventDefault();
-    }
-    if (c === 'KeyM' && !e.repeat) {
-      this.toggleMute();
-      return;
-    }
-    if ((c === 'KeyP' || c === 'Escape') && !e.repeat) {
-      this.togglePause();
-      return;
-    }
-    if ((c === 'Space' || c === 'KeyB' || c === 'KeyX' || c === 'ShiftLeft' || c === 'ShiftRight') && !e.repeat) {
-      this.bomb();
-    }
-    this.keys.add(c);
-  };
-
-  private onKeyUp = (e: KeyboardEvent) => {
-    this.keys.delete(e.code);
-  };
-
-  private onBlur = () => {
-    this.keys.clear();
-    if (document.hidden || !document.hasFocus()) this.pause();
-  };
-
-  private toCanvas(ev: PointerEvent) {
-    const r = this.canvas.getBoundingClientRect();
-    return { x: ((ev.clientX - r.left) / r.width) * W, y: ((ev.clientY - r.top) / r.height) * H };
-  }
-
-  private onPointerDown = (ev: PointerEvent) => {
-    this.sfx.unlock();
-    const c = this.toCanvas(ev);
-    this.pointer = { active: true, sx: c.x, sy: c.y };
-    this.baseX = this.p.x;
-    this.baseY = this.p.y;
-    this.tx = this.p.x;
-    this.ty = this.p.y;
-    try {
-      this.canvas.setPointerCapture(ev.pointerId);
-    } catch {
-      /* ignore */
-    }
-  };
-
-  private onPointerMove = (ev: PointerEvent) => {
-    if (!this.pointer.active) return;
-    const c = this.toCanvas(ev);
-    this.tx = this.baseX + (c.x - this.pointer.sx);
-    this.ty = this.baseY + (c.y - this.pointer.sy);
-  };
-
-  private onPointerUp = () => {
-    this.pointer.active = false;
-  };
-
-  private tx = W / 2;
-  private ty = H - 120;
-  private baseX = W / 2;
-  private baseY = H - 120;
-
-  /* ------------------------------------------------------------------ */
-  /* Welt                                                                */
-  /* ------------------------------------------------------------------ */
-
-  private resetWorld() {
-    this.p = {
-      x: W / 2,
-      y: H - 120,
-      hp: 100,
-      maxHp: 100,
-      weapon: 1,
-      shield: 0,
-      invuln: 1.5,
-      bombs: 2,
-      fireCd: 0,
-      alive: true,
-      hit: 9,
+  serialize(): SaveData {
+    const physical: Record<string, Partial<PhysicalBuildingState>> = {};
+    for (const b of this.buildings) if (b.physical) { const p = b.physical; physical[b.id] = { input: p.input, output: p.output, production: p.production, productionProgress: p.productionProgress, rotation: p.rotation, level: p.level, lastOutputAt: 0 }; }
+    return {
+      v: SAVE_VERSION,
+      seed: this.seed,
+      buildings: this.buildings.map((b) => ({ i: b.id, t: b.type, x: b.x, y: b.y, p: b.built ? 1 : Math.round(b.progress * 1000) / 1000, r: b.rotation })),
+      res: Object.fromEntries(RES_IDS.map((r) => [r, Math.round(this.resCache[r] * 100) / 100])),
+      xp: Math.round(this.xp * 100) / 100,
+      level: this.level,
+      pop: Math.round(this.pop * 100) / 100,
+      soldiers: Math.round(this.soldiers * 100) / 100,
+      playTime: Math.round(this.playTime),
+      research: this.research,
+      questsDone: this.questsDone,
+      tradeCount: this.tradeCount,
+      residents: this.residents.map((r) => ({ ...r, path: [], x: Math.round(r.x * 100) / 100, y: Math.round(r.y * 100) / 100 })),
+      transportOrders: this.transportOrders,
+      localStorage: physical,
+      treeGrowth: Object.fromEntries([...this.treeGrowth].map(([k, v]) => [k, Math.round(v * 1000) / 1000])),
+      treeEmpty: Object.fromEntries([...this.treeEmpty].map(([k, v]) => [k, Math.round(v)])),
+      fieldStates: Object.fromEntries(this.buildings.filter((b) => b.field).map((b) => [b.id, b.field!])),
+      depositRemaining: Object.fromEntries([...this.depositRemaining].filter(([i, v]) => v !== initialDeposit(this, i))),
+      transportStats: this.transportStats,
+      lostGoods: this.lostGoods as Record<string, number>,
     };
-    this.tx = this.p.x;
-    this.ty = this.p.y;
-    this.baseX = this.p.x;
-    this.baseY = this.p.y;
-    this.pointer.active = false;
-    this.bullets = [];
-    this.enemies = [];
-    this.pickups = [];
-    this.parts = [];
-    this.rings = [];
-    this.texts = [];
-    this.queue = [];
-    this.banner = null;
-    this.score = 0;
-    this.wave = 0;
-    this.kills = 0;
-    this.bosses = 0;
-    this.time = 0;
-    this.combo = 0;
-    this.comboT = 0;
-    this.waveT = 0;
-    this.waveDelay = -1;
-    this.shake = 0;
-    this.flash = 0;
-    this.deathT = 0;
-    this.bossRef = null;
   }
 
-  private buildNebula() {
-    const c = document.createElement('canvas');
-    c.width = W;
-    c.height = H;
-    const g = c.getContext('2d')!;
-    const bg = g.createLinearGradient(0, 0, 0, H);
-    bg.addColorStop(0, '#06061a');
-    bg.addColorStop(0.5, '#0c0a2a');
-    bg.addColorStop(1, '#06061a');
-    g.fillStyle = bg;
-    g.fillRect(0, 0, W, H);
-    const cols = ['120,60,220', '40,120,255', '220,60,160', '30,200,200'];
-    for (let i = 0; i < 7; i++) {
-      const x = rand(0, W);
-      const y = rand(160, H - 160);
-      const r = rand(90, 160);
-      const col = cols[i % cols.length];
-      const rg = g.createRadialGradient(x, y, 0, x, y, r);
-      rg.addColorStop(0, `rgba(${col},0.22)`);
-      rg.addColorStop(1, `rgba(${col},0)`);
-      g.fillStyle = rg;
-      g.fillRect(x - r, y - r, r * 2, r * 2);
-    }
-    return c;
+  /* ============================================================ Abonnements */
+  subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
+  private notify() { this.version++; this.listeners.forEach((l) => l()); }
+  setSimulationSpeed(speed: 0 | 1 | 2) { this.simulationSpeed = speed; this.notify(); }
+  toast(text: string, kind: Toast["kind"] = "info") {
+    this.toasts.push({ id: this.toastId++, text, kind, t: this.clock });
+    if (this.toasts.length > 5) this.toasts.shift();
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Wellen                                                              */
-  /* ------------------------------------------------------------------ */
+  /* ============================================================ Einwohner-Index */
+  addResident(r: Resident) { this.residents.push(r); this.residentById.set(r.id, r); }
+  removeResident(r: Resident) { this.residents = this.residents.filter((x) => x !== r); this.residentById.delete(r.id); }
+  getResident(id: number): Resident | undefined { return this.residentById.get(id); }
+  workersAt(id: number): Resident[] { return this.workerIndex.get(id) ?? []; }
+  private indexWorkers() {
+    this.workerIndex.clear();
+    for (const r of this.residents) if (r.workplaceId !== null) { const l = this.workerIndex.get(r.workplaceId); if (l) l.push(r); else this.workerIndex.set(r.workplaceId, [r]); }
+  }
 
-  private startWave(n: number) {
-    this.wave = n;
-    this.waveT = 0;
-    this.waveDelay = -1;
-    this.queue = [];
-    const q = this.queue;
+  /* ================================================================ Wirtschaft (API) */
+  getTotalResource(r: ResId) { return getTotalResource(this, r); }
+  getEconomyTotal(r: ResId) { return getEconomyTotal(this, r); }
+  getSpendableResource(r: ResId) { return getSpendableResource(this, r); }
+  getResourceCapacity(r: ResId) { return getResourceCapacity(this, r); }
+  canAfford(cost: ResAmounts) { return canAfford(this, cost); }
+  consumeResource(r: ResId, n: number) { return consumeResource(this, r, n); }
+  consumeCost(cost: ResAmounts) { return consumeCost(this, cost); }
+  depositResource(r: ResId, n: number) { return depositResource(this, r, n); }
+  /** Test/Debug: Hub-Bestand direkt setzen */
+  setResources(stock: Partial<Record<ResId, number>>) { setHubStock(this, stock); }
+  hubCapacity(r: ResId): number { return Math.floor(this.limit[r] / Math.max(1, this.hubs.length)); }
+  logistics() { return logisticsSummary(this); }
 
-    if (n % 5 === 0) {
-      q.push({ t: 3.2, kind: 'boss', x: W / 2 });
-      for (let i = 0; i < 10; i++) {
-        const t = 10 + i * 5.5;
-        if (i % 3 === 2) {
-          q.push({ t, kind: 'zig', x: rand(80, W - 80), dir: Math.random() < 0.5 ? -1 : 1 });
-        } else {
-          const x = rand(100, W - 100);
-          for (let k = 0; k < 3; k++) q.push({ t: t + k * 0.4, kind: 'scout', x });
-        }
+  /* ================================================================== Bauen */
+  private idx(x: number, y: number) { return y * MAP_SIZE + x; }
+  private inb(x: number, y: number) { return x >= 0 && y >= 0 && x < MAP_SIZE && y < MAP_SIZE; }
+  footprint(type: BuildingId, rotation: Rot = 0): [number, number] { const [w, h] = BUILDINGS[type].size; return rotation % 2 ? [h, w] : [w, h]; }
+  private terrainFree(type: BuildingId, x: number, y: number, rotation: Rot = 0): boolean {
+    const [w, h] = this.footprint(type, rotation);
+    for (let j = 0; j < h; j++)
+      for (let i = 0; i < w; i++) {
+        if (!this.inb(x + i, y + j)) return false;
+        const t = this.map.terrain[this.idx(x + i, y + j)];
+        if (t !== T.GRASS && t !== T.SAND) return false;
+        if (this.occ[this.idx(x + i, y + j)]) return false;
       }
-      const bn = BOSS_NAMES[(n / 5 - 1) % 3];
-      this.banner = { text: 'WARNUNG', sub: `${bn} nähert sich!`, t: 3, max: 3, color: '#ff4d6d' };
-      this.sfx.warn();
-    } else {
-      const pool: [EnemyKind, number][] = [['scout', 5]];
-      if (n >= 2) pool.push(['zig', 3]);
-      if (n >= 3) pool.push(['kamikaze', 2.5], ['tank', 1 + Math.min(n * 0.1, 1.5)]);
-      if (n >= 4) pool.push(['shooter', 2 + Math.min(n * 0.1, 1.5)]);
-      const total = pool.reduce((s, [, w]) => s + w, 0);
-      const pick = (): EnemyKind => {
-        let r = Math.random() * total;
-        for (const [k, w] of pool) {
-          r -= w;
-          if (r <= 0) return k;
-        }
-        return 'scout';
-      };
-      const groups = Math.min(4 + Math.floor(n * 1.1), 16);
-      const gap = Math.max(1.6, 3.2 - n * 0.08);
-      let t = 1.6;
-      for (let g = 0; g < groups; g++) {
-        const kind = pick();
-        switch (kind) {
-          case 'scout': {
-            const x = rand(110, W - 110);
-            for (let i = 0; i < 4; i++) q.push({ t: t + i * 0.45, kind, x });
-            break;
-          }
-          case 'zig': {
-            const dir = Math.random() < 0.5 ? -1 : 1;
-            const x = dir > 0 ? rand(50, 160) : rand(W - 160, W - 50);
-            const cnt = 2 + (n > 6 ? 1 : 0);
-            for (let i = 0; i < cnt; i++) q.push({ t: t + i * 0.7, kind, x, dir });
-            break;
-          }
-          case 'kamikaze': {
-            const cnt = Math.min(2 + Math.floor(n / 4), 5);
-            for (let i = 0; i < cnt; i++) q.push({ t: t + i * 0.35, kind, x: rand(40, W - 40) });
-            break;
-          }
-          case 'shooter': {
-            const cnt = n > 8 ? 2 : 1;
-            for (let i = 0; i < cnt; i++) q.push({ t: t + i * 1.4, kind, x: rand(80, W - 80) });
-            break;
-          }
-          case 'tank': {
-            const cnt = n > 10 ? 2 : 1;
-            for (let i = 0; i < cnt; i++) q.push({ t: t + i * 2, kind, x: rand(70, W - 70) });
-            break;
-          }
-          default:
-            break;
-        }
-        t += gap;
-      }
-      this.banner = { text: `WELLE ${n}`, sub: n === 4 ? 'Nächste Welle: Boss!' : 'Bereit machen', t: 2.2, max: 2.2, color: '#4cc9f0' };
-      if (n > 1) this.sfx.wave();
-    }
-    q.sort((a, b) => a.t - b.t);
-  }
-
-  private spawnEnemy(kind: EnemyKind, x: number, dir?: number) {
-    const n = this.wave;
-    const hpMul = this.diff.hp * (1 + n * 0.04);
-    const spd = this.diff.speed;
-    const e: Enemy = {
-      kind,
-      x,
-      y: -30,
-      baseX: x,
-      vx: 0,
-      vy: 0,
-      r: 14,
-      hp: 1,
-      maxHp: 1,
-      t: 0,
-      cd: rand(0.8, 2.2),
-      cd2: 0,
-      cd3: 0,
-      score: 100,
-      flash: 0,
-      dir: dir ?? (Math.random() < 0.5 ? -1 : 1),
-      angle: Math.PI / 2,
-      phase: 0,
-      bossType: 0,
-      entered: true,
-      dead: false,
-    };
-    switch (kind) {
-      case 'scout':
-        e.r = 14;
-        e.hp = 2 * hpMul;
-        e.vy = Math.min(95 + n * 4, 170) * spd;
-        e.score = 100;
-        break;
-      case 'zig':
-        e.r = 15;
-        e.hp = 3 * hpMul;
-        e.vy = 80 * spd;
-        e.vx = 130 * spd;
-        e.score = 150;
-        break;
-      case 'tank':
-        e.r = 24;
-        e.hp = 14 * hpMul;
-        e.vy = 38 * spd;
-        e.score = 400;
-        e.cd = 1.2;
-        break;
-      case 'kamikaze':
-        e.r = 13;
-        e.hp = 2 * hpMul;
-        e.vy = (220 + Math.min(n * 5, 90)) * spd;
-        e.score = 120;
-        e.y = -20;
-        break;
-      case 'shooter':
-        e.r = 20;
-        e.hp = 8 * hpMul;
-        e.vy = 120;
-        e.vx = 70 * spd;
-        e.score = 300;
-        e.cd = 1.6;
-        e.cd2 = rand(90, 170); // Zielhöhe
-        break;
-      case 'boss': {
-        const bn = Math.floor(n / 5) - 1;
-        e.bossType = bn % 3;
-        e.r = [44, 52, 60][e.bossType];
-        e.hp = (260 + bn * 140) * this.diff.hp;
-        e.y = -90;
-        e.vy = 70;
-        e.score = 5000 + bn * 2500;
-        e.entered = false;
-        e.cd = 1;
-        e.cd2 = 0.5;
-        e.cd3 = 7;
-        this.bossRef = e;
-        break;
-      }
-    }
-    e.maxHp = e.hp;
-    this.enemies.push(e);
-    return e;
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* Schüsse                                                             */
-  /* ------------------------------------------------------------------ */
-
-  private eShoot(x: number, y: number, ang: number, speed: number, size: 's' | 'b', color?: string) {
-    const sp = speed * this.diff.speed * (1 + Math.min(this.wave, 25) * 0.01);
-    this.bullets.push({
-      x,
-      y,
-      vx: Math.cos(ang) * sp,
-      vy: Math.sin(ang) * sp,
-      r: size === 's' ? 4.5 : 7.5,
-      dmg: (size === 's' ? 10 : 16) * this.diff.dmg,
-      friendly: false,
-      color: color ?? (size === 's' ? '#ff5d8f' : '#ffa62b'),
-      dead: false,
-    });
-    this.sfx.enemyShoot();
-  }
-
-  private aim(x: number, y: number) {
-    return Math.atan2(this.p.y - y, this.p.x - x);
-  }
-
-  private pShoot(x: number, y: number, ang: number, dmg = 1) {
-    const sp = 720;
-    this.bullets.push({
-      x,
-      y,
-      vx: Math.sin(ang) * sp,
-      vy: -Math.cos(ang) * sp,
-      r: 4,
-      dmg,
-      friendly: true,
-      color: this.p.weapon >= 5 ? '#ffd166' : this.p.weapon >= 3 ? '#9dffb0' : '#7df9ff',
-      dead: false,
-    });
-  }
-
-  private playerFire() {
-    const p = this.p;
-    const x = p.x;
-    const y = p.y - 18;
-    switch (p.weapon) {
-      case 1:
-        this.pShoot(x, y, 0);
-        break;
-      case 2:
-        this.pShoot(x - 8, y, 0);
-        this.pShoot(x + 8, y, 0);
-        break;
-      case 3:
-        this.pShoot(x, y - 4, 0);
-        this.pShoot(x - 10, y, -0.08);
-        this.pShoot(x + 10, y, 0.08);
-        break;
-      case 4:
-        this.pShoot(x - 6, y - 4, 0);
-        this.pShoot(x + 6, y - 4, 0);
-        this.pShoot(x - 14, y, -0.14);
-        this.pShoot(x + 14, y, 0.14);
-        break;
-      default:
-        this.pShoot(x, y - 6, 0, 1.3);
-        this.pShoot(x - 9, y - 2, -0.06, 1.2);
-        this.pShoot(x + 9, y - 2, 0.06, 1.2);
-        this.pShoot(x - 16, y, -0.2, 1);
-        this.pShoot(x + 16, y, 0.2, 1);
-        break;
-    }
-    this.sfx.shoot();
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* Effekte                                                             */
-  /* ------------------------------------------------------------------ */
-
-  private spark(x: number, y: number, color: string, n: number, speed: number) {
-    for (let i = 0; i < n && this.parts.length < 700; i++) {
-      const a = rand(0, Math.PI * 2);
-      const s = rand(0.3, 1) * speed;
-      this.parts.push({
-        x,
-        y,
-        vx: Math.cos(a) * s,
-        vy: Math.sin(a) * s,
-        life: rand(0.2, 0.5),
-        max: 0.5,
-        size: rand(1.2, 2.6),
-        color,
-        glow: true,
-      });
-    }
-  }
-
-  private explode(x: number, y: number, size: number, big = false) {
-    const cols = ['#fff3b0', '#ffd166', '#ff9f1c', '#ff5d3a', '#ff2e63'];
-    const n = Math.floor(size * (big ? 3 : 2));
-    for (let i = 0; i < n && this.parts.length < 700; i++) {
-      const a = rand(0, Math.PI * 2);
-      const s = rand(0.15, 1) * (big ? 360 : 220);
-      const life = rand(0.35, big ? 1.3 : 0.85);
-      this.parts.push({
-        x,
-        y,
-        vx: Math.cos(a) * s,
-        vy: Math.sin(a) * s,
-        life,
-        max: life,
-        size: rand(1.5, big ? 5.5 : 3.8),
-        color: cols[Math.floor(rand(0, cols.length))],
-        glow: true,
-      });
-    }
-    this.rings.push({
-      x,
-      y,
-      r: 4,
-      max: size * (big ? 4 : 2.8),
-      life: big ? 0.6 : 0.35,
-      max_life: big ? 0.6 : 0.35,
-      color: '#ffd9a0',
-      width: big ? 5 : 3,
-    });
-    this.sfx.explode(big);
-  }
-
-  private floatText(x: number, y: number, text: string, color = '#ffe29a', size = 14) {
-    this.texts.push({ x, y, text, life: 1, color, size });
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* Schaden / Tod                                                       */
-  /* ------------------------------------------------------------------ */
-
-  private mult() {
-    return 1 + Math.min(Math.floor(this.combo / 6), 5);
-  }
-
-  private addScore(base: number, x: number, y: number) {
-    const pts = Math.round(base * this.mult() * this.diff.score);
-    this.score += pts;
-    this.floatText(x, y, `+${pts}`, this.mult() > 1 ? '#ffd166' : '#d0e8ff', base >= 300 ? 18 : 13);
-  }
-
-  private hitEnemy(e: Enemy, dmg: number, fromBomb = false) {
-    if (e.dead) return;
-    if (e.kind === 'boss' && !e.entered) return;
-    e.hp -= dmg;
-    e.flash = 0.07;
-    if (!fromBomb) this.sfx.hit();
-    if (e.hp <= 0) this.killEnemy(e);
-  }
-
-  private killEnemy(e: Enemy) {
-    e.dead = true;
-    this.kills++;
-    this.combo++;
-    this.comboT = 2.6;
-    if (e.kind === 'boss') {
-      this.bosses++;
-      this.addScore(e.score, e.x, e.y);
-      for (let i = 0; i < 6; i++) {
-        window.setTimeout(() => {
-          if (this.alive) this.explode(e.x + rand(-e.r, e.r), e.y + rand(-e.r, e.r), 40, true);
-        }, i * 120);
-      }
-      this.explode(e.x, e.y, 90, true);
-      this.shake = 26;
-      this.flash = 0.8;
-      this.banner = { text: 'BOSS BESIEGT!', sub: `+${Math.round(e.score * this.mult() * this.diff.score)} Punkte`, t: 2.6, max: 2.6, color: '#ffd166' };
-      // Alles andere zerstören
-      for (const o of this.enemies) {
-        if (o !== e && !o.dead) {
-          o.dead = true;
-          this.explode(o.x, o.y, o.r * 1.6);
-        }
-      }
-      for (const b of this.bullets) {
-        if (!b.friendly) {
-          b.dead = true;
-          this.spark(b.x, b.y, '#ffe29a', 2, 50);
-        }
-      }
-      this.queue = [];
-      this.bossRef = null;
-      this.dropPickup(e.x - 40, e.y, 'power');
-      this.dropPickup(e.x, e.y, 'health');
-      this.dropPickup(e.x + 40, e.y, Math.random() < 0.5 ? 'bomb' : 'shield');
-      return;
-    }
-    this.addScore(e.score, e.x, e.y);
-    this.explode(e.x, e.y, e.r * 1.6, e.kind === 'tank');
-    if (e.kind === 'tank') this.shake = Math.max(this.shake, 6);
-    const chance = { scout: 0.06, zig: 0.08, kamikaze: 0.07, shooter: 0.3, tank: 0.6, boss: 0 }[e.kind];
-    if (Math.random() < chance) this.dropPickup(e.x, e.y);
-  }
-
-  private dropPickup(x: number, y: number, kind?: PickupKind) {
-    if (!kind) {
-      const p = this.p;
-      const w: [PickupKind, number][] = [
-        ['power', p.weapon >= 5 ? 6 : 34],
-        ['shield', 20],
-        ['health', p.hp < 60 ? 40 : p.hp < 100 ? 22 : 5],
-        ['bomb', p.bombs >= 5 ? 4 : 18],
-      ];
-      const tot = w.reduce((s, [, v]) => s + v, 0);
-      let r = Math.random() * tot;
-      kind = 'power';
-      for (const [k, v] of w) {
-        r -= v;
-        if (r <= 0) {
-          kind = k;
-          break;
-        }
-      }
-    }
-    this.pickups.push({ kind, x, y, t: 0 });
-  }
-
-  private hurt(dmg: number) {
-    const p = this.p;
-    if (!p.alive || p.invuln > 0) return false;
-    if (p.shield > 0) {
-      p.invuln = 0.35;
-      this.sfx.shieldHit();
-      this.rings.push({ x: p.x, y: p.y, r: 18, max: 46, life: 0.3, max_life: 0.3, color: '#4cc9f0', width: 3 });
-      return true;
-    }
-    p.hp -= dmg;
-    p.invuln = 1.3;
-    this.shake = Math.max(this.shake, 10);
-    this.combo = 0;
-    this.comboT = 0;
-    if (p.weapon > 1) p.weapon--;
-    this.sfx.hurt();
-    this.spark(p.x, p.y, '#ff6b6b', 14, 200);
-    if (p.hp <= 0) {
-      p.hp = 0;
-      p.alive = false;
-      this.deathT = 2.2;
-      this.explode(p.x, p.y, 70, true);
-      this.shake = 24;
-      this.sfx.gameOver();
-    }
     return true;
   }
 
-  private finish() {
-    const isRecord = this.score > this.best;
-    if (isRecord) {
-      this.best = this.score;
-      try {
-        localStorage.setItem(BEST_KEY, String(this.best));
-      } catch {
-        /* ignore */
-      }
-      window.setTimeout(() => this.alive && this.sfx.record(), 500);
-    }
-    this.state = 'over';
-    this.cb.onState(this.state);
-    this.cb.onGameOver({
-      score: this.score,
-      wave: this.wave,
-      kills: this.kills,
-      time: this.time,
-      best: this.best,
-      isRecord,
-      difficulty: this.diffKey,
-      bosses: this.bosses,
-    });
+  private addBuilding(type: BuildingId, x: number, y: number, built: boolean, rotation: Rot = 0): Building | null {
+    if (!this.terrainFree(type, x, y, rotation)) return null;
+    const b: Building = {
+      id: this.nextId++, type, x, y, progress: built ? 1 : 0, built,
+      status: built ? "ok" : "constructing", workers: 0, crew: {}, connected: false, site: 1, eff: 0, mineRes: null, missing: null, rotation,
+    };
+    const needsState = PHYSICAL_TYPES.includes(type) || (!built && !CONSTRUCTION.instant.includes(type));
+    if (needsState) b.physical = newPhysicalState(rotation);
+    if (type === "field") b.field = { stage: "EMPTY", progress: 0, crop: "getreide", farmerId: null, yieldAmount: 4 };
+    this.buildings.push(b);
+    this.byId.set(b.id, b);
+    const [w, h] = this.footprint(type, rotation);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.occ[this.idx(x + i, y + j)] = b.id;
+    this.dirtyFlag = true;
+    return b;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Update                                                              */
-  /* ------------------------------------------------------------------ */
+  /** Baustelle abschließen: Material verbraucht, Gebäude funktionsfähig */
+  completeBuilding(b: Building) {
+    if (b.built) return;
+    const def = BUILDINGS[b.type];
+    b.built = true; b.progress = 1; b.status = "ok"; b.siteState = undefined;
+    if (b.physical) { b.physical.input = {}; b.physical.reservedInput = {}; if (!PHYSICAL_TYPES.includes(b.type)) b.physical = undefined; }
+    for (const r of this.residents) if (r.workTargetId === b.id && r.job === "baumeister") { r.workTargetId = null; r.atWork = false; r.state = "WAITING"; r.path = []; r.pathIndex = 0; }
+    this.addXp(def.xp);
+    if (def.id !== "road") this.toast(`${def.name} fertiggestellt`, "good");
+    this.dirtyFlag = true;
+  }
 
-  private loop = (now: number) => {
-    if (!this.alive) return;
-    const dt = Math.min((now - this.lastT) / 1000, 1 / 30);
-    this.lastT = now;
+  getBuilding(id: number): Building | undefined { return this.byId.get(id); }
+  buildingAt(x: number, y: number): Building | undefined {
+    if (!this.inb(x, y)) return undefined;
+    const id = this.occ[this.idx(x, y)];
+    return id ? this.byId.get(id) : undefined;
+  }
+  count(type: BuildingId, builtOnly = true): number {
+    let n = 0;
+    for (const b of this.buildings) if (b.type === type && (!builtOnly || b.built)) n++;
+    return n;
+  }
+  isProcessor(b: Building) { return PROCESSORS.includes(b.type); }
+
+  private upgradeSpec(b: Building) { const lvl = b.physical?.level; return lvl === 2 || lvl === 3 ? UPGRADE_LEVELS[b.type]?.[lvl] : undefined; }
+  /** Produktions-/Arbeitsgeschwindigkeit: Forschung × Upgrade-Stufe */
+  speedMult(b: Building): number { return (1 + this.techProdMult(b.type)) * (this.upgradeSpec(b)?.speed ?? 1); }
+  rangeBonus(b: Building): number { return this.upgradeSpec(b)?.range ?? 0; }
+  /** Stellen des Hauptberufs (inkl. Upgrade-Stufe) */
+  slotsOf(b: Building): number { const d = BUILDINGS[b.type]; return d.jobs ? d.jobs.count + (this.upgradeSpec(b)?.workerSlots ?? 0) : 0; }
+
+  canUpgrade(id: number): { ok: boolean; reason?: string; level?: 2 | 3; cost?: ResAmounts } {
+    const b = this.getBuilding(id), current = b?.physical?.level ?? 1, next = (current + 1) as 2 | 3, spec = b ? UPGRADE_LEVELS[b.type]?.[next] : undefined;
+    if (!b || !b.built || !b.physical || !spec) return { ok: false, reason: current >= 3 ? "Maximale Stufe erreicht" : "Gebäude nicht upgradefähig" };
+    for (const [r, n] of Object.entries(spec.cost) as [ResId, number][]) if (this.getSpendableResource(r) < n) return { ok: false, reason: `Nicht genug ${RESOURCES[r].name}`, level: next, cost: spec.cost };
+    return { ok: true, level: next, cost: spec.cost };
+  }
+  upgradeBuilding(id: number): { ok: boolean; reason?: string } {
+    const check = this.canUpgrade(id);
+    if (!check.ok || !check.level || !check.cost) return { ok: false, reason: check.reason };
+    if (!this.consumeCost(check.cost)) return { ok: false, reason: "Nicht genug Rohstoffe" };
+    const b = this.getBuilding(id)!;
+    b.physical!.level = check.level; this.dirtyFlag = true; this.recompute(); this.toast(`${BUILDINGS[b.type].name} auf Stufe ${check.level} verbessert`, "good"); this.notify();
+    return { ok: true };
+  }
+
+  /** Standortqualität für ein (auch noch nicht gebautes) Gebäude */
+  computeSite(type: BuildingId, x: number, y: number): { factor: number; mineRes: ResId | null } {
+    const def = BUILDINGS[type];
+    const s = def.site;
+    if (!s) return { factor: 1, mineRes: null };
+    const [w, h] = def.size;
+    if (s.kind === "fields") {
+      const cx = x + w / 2, cy = y + h / 2;
+      let n = 0;
+      for (const b of this.buildings) {
+        if (b.type !== "field" || !b.built) continue;
+        if (Math.hypot(b.x + 1 - cx, b.y + 1 - cy) <= s.radius) n++;
+      }
+      return { factor: Math.min(1, n / s.full), mineRes: null };
+    }
+    const counts = [0, 0, 0, 0];
+    let forest = 0, mountain = 0;
+    for (let yy = y - s.radius; yy < y + h + s.radius; yy++)
+      for (let xx = x - s.radius; xx < x + w + s.radius; xx++) {
+        if (!this.inb(xx, yy)) continue;
+        const i = this.idx(xx, yy);
+        const t = this.map.terrain[i];
+        if (t === T.FOREST) forest++;
+        else if (t === T.MOUNTAIN) { mountain++; counts[this.map.deposit[i]]++; }
+      }
+    if (s.kind === "forest") return { factor: Math.min(1, forest / s.full), mineRes: null };
+    if (s.kind === "mountain") return { factor: Math.min(1, mountain / s.full), mineRes: null };
+    let best = 1;
+    for (const k of [1, 2, 3]) if (counts[k] > counts[best]) best = k;
+    const n = counts[best];
+    const DEPRES: Record<number, ResId> = { 1: "eisen", 2: "kohle", 3: "gold" };
+    return { factor: Math.min(1, n / s.full), mineRes: n > 0 ? DEPRES[best] : null };
+  }
+
+  checkPlace(type: BuildingId, x: number, y: number, rotation: Rot = this.ui.buildRotation): PlaceCheck {
+    const def = BUILDINGS[type];
+    if (this.level < def.unlock) return { ok: false, reason: `Ab Level ${def.unlock} verfügbar`, site: null, mineRes: null };
+    const [w, h] = this.footprint(type, rotation);
+    for (let j = 0; j < h; j++)
+      for (let i = 0; i < w; i++) {
+        if (!this.inb(x + i, y + j)) return { ok: false, reason: "Außerhalb der Karte", site: null, mineRes: null };
+        const t = this.map.terrain[this.idx(x + i, y + j)];
+        if (t !== T.GRASS && t !== T.SAND) return { ok: false, reason: "Gelände nicht bebaubar", site: null, mineRes: null };
+        if (this.occ[this.idx(x + i, y + j)]) return { ok: false, reason: "Bereits bebaut", site: null, mineRes: null };
+      }
+    const { factor, mineRes } = this.computeSite(type, x, y);
+    if (def.site && def.site.kind !== "fields" && factor <= 0) return { ok: false, reason: `Keine ${def.site.label} in Reichweite`, site: 0, mineRes };
+    // Straßen/Felder werden sofort bezahlt; alle anderen Gebäude erhalten ihr Material per Träger auf der Baustelle.
+    if (CONSTRUCTION.instant.includes(type)) {
+      for (const [r, n] of Object.entries(def.cost) as [ResId, number][]) if (this.getSpendableResource(r) < n) return { ok: false, reason: `Nicht genug ${RESOURCES[r].name}`, site: def.site ? factor : null, mineRes };
+    }
+    return { ok: true, reason: null, site: def.site ? factor : null, mineRes };
+  }
+
+  /** Dreht so, dass ein Zugang auf eine angebundene Straße trifft (sonst aktuelle Rotation). */
+  bestRotation(type: BuildingId, x: number, y: number): Rot {
+    const cur = this.ui.buildRotation;
+    if (type === "road" || type === "field") return cur;
+    for (let k = 0; k < 4; k++) {
+      const rot = ((cur + k) % 4) as Rot;
+      if (!this.terrainFree(type, x, y, rot)) continue;
+      if (accessTiles(type, x, y, rot).some(([ax, ay]) => this.roadReach[this.idx(ax, ay)] === 1)) return rot;
+    }
+    return cur;
+  }
+
+  /** Baustelle platzieren (Straße/Feld: sofort bezahlt). Kosten für Gebäude werden physisch geliefert. */
+  place(type: BuildingId, x: number, y: number, rotation: Rot = this.ui.buildRotation): PlaceCheck {
+    const check = this.checkPlace(type, x, y, rotation);
+    if (!check.ok) return check;
+    if (CONSTRUCTION.instant.includes(type) && !this.consumeCost(BUILDINGS[type].cost)) return { ...check, ok: false, reason: "Nicht genug Rohstoffe" };
+    this.addBuilding(type, x, y, false, rotation);
+    this.notify();
+    return check;
+  }
+
+  /** Abriss: Baustellen geben gelieferte Materialien zurück, fertige Gebäude 50 % der Kosten; Lagerinhalte gehen in die Hubs. */
+  demolish(id: number): { ok: boolean; reason?: string } {
+    const b = this.byId.get(id);
+    if (!b) return { ok: false, reason: "Nicht gefunden" };
+    const def = BUILDINGS[b.type];
+    if (def.hub && b.built && this.buildings.filter((o) => BUILDINGS[o.type].hub && o.built && o.id !== id).length === 0)
+      return { ok: false, reason: "Das letzte Lagerhaus kann nicht abgerissen werden." };
+    onBuildingRemoved(this, id);
+    for (const r of [...this.residents]) {
+      if (r.workplaceId === id && !(r.job === "traeger" && r.orderId !== null)) releaseResident(this, r);
+      else if (r.workplaceId === id) { r.workplaceId = null; }
+      if (r.homeBuildingId === id) r.homeBuildingId = null;
+      if (r.workTargetId === id && r.job === "baumeister") { r.workTargetId = null; r.state = "WAITING"; r.path = []; r.pathIndex = 0; }
+    }
+    if (b.field?.farmerId) { const f = this.getResident(b.field.farmerId); if (f) { f.workTargetId = null; f.state = "WAITING"; } }
+    const contents: ResAmounts = {};
+    if (b.physical) for (const s of [b.physical.input, b.physical.output]) for (const [r, n] of Object.entries(s) as [ResId, number][]) if (n > 0) contents[r] = (contents[r] ?? 0) + n;
+    const [w, h] = this.footprint(b.type, b.rotation);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.occ[this.idx(b.x + i, b.y + j)] = 0;
+    this.buildings = this.buildings.filter((o) => o.id !== id);
+    this.byId.delete(id);
+    if (this.ui.selectedId === id) this.ui.selectedId = null;
+    this.dirtyFlag = true;
+    this.recompute();
+    for (const [r, n] of Object.entries(contents) as [ResId, number][]) { const put = depositResource(this, r, n); if (n - put > 1e-6) this.lostGoods[r] = (this.lostGoods[r] ?? 0) + (n - put); }
+    if (b.built) depositCost(this, def.cost, CONSTRUCTION.demolishRefund);
+    this.computeStats();
+    this.notify();
+    return { ok: true };
+  }
+
+  /* ======================================================== UI-Interaktion */
+
+  setBuildType(t: BuildingId | null) {
+    this.ui.buildType = t;
+    if (!t) this.ui.buildRotation = 0;
+    this.ui.ghost = null;
+    if (t) this.ui.selectedId = null;
+    this.notify();
+  }
+  select(id: number | null) { this.ui.selectedId = id; this.notify(); }
+  rotateBuild() { this.ui.buildRotation = ((this.ui.buildRotation + 1) % 4) as Rot; const g = this.ui.ghost; if (g && this.ui.buildType) g.check = this.checkPlace(this.ui.buildType, g.x, g.y); this.notify(); }
+  /** Gebäude um 90° drehen (Footprint, Zugang und Belegung folgen; Wegenetz wird neu berechnet) */
+  rotateBuilding(id: number): boolean {
+    const b = this.getBuilding(id);
+    if (!b || b.type === "road" || b.type === "field") return false;
+    const next = ((b.rotation + 1) % 4) as Rot;
+    const [oldW, oldH] = this.footprint(b.type, b.rotation);
+    for (let j = 0; j < oldH; j++) for (let i = 0; i < oldW; i++) this.occ[this.idx(b.x + i, b.y + j)] = 0;
+    const ok = this.terrainFree(b.type, b.x, b.y, next);
+    const [w, h] = ok ? this.footprint(b.type, next) : [oldW, oldH];
+    if (ok) { b.rotation = next; if (b.physical) b.physical.rotation = next; }
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.occ[this.idx(b.x + i, b.y + j)] = b.id;
+    if (!ok) return false;
+    this.dirtyFlag = true; this.recompute(); this.notify();
+    return true;
+  }
+
+  setGhost(x: number, y: number) {
+    const t = this.ui.buildType;
+    if (!t) return;
+    const g = this.ui.ghost;
+    if (g && g.x === x && g.y === y) { g.check = this.checkPlace(t, x, y); return; }
+    this.ui.ghost = { x, y, check: this.checkPlace(t, x, y) };
+    this.notify();
+  }
+  clearGhost() { if (this.ui.ghost) { this.ui.ghost = null; this.notify(); } }
+
+  confirmGhost(): PlaceCheck | null {
+    const t = this.ui.buildType, g = this.ui.ghost;
+    if (!t || !g) return null;
+    const rot = this.bestRotation(t, g.x, g.y);
+    if (rot !== this.ui.buildRotation) this.ui.buildRotation = rot;
+    const r = this.place(t, g.x, g.y, rot);
+    if (!r.ok && r.reason) this.toast(r.reason, "warn");
+    g.check = this.checkPlace(t, g.x, g.y);
+    return r;
+  }
+
+  /* ==================================================== Netz & Ableitungen */
+
+  /** Straßennetz, Anbindung, Standortqualität, Hubs und Limits neu berechnen (bei jeder Strukturänderung) */
+  recompute() {
+    const N = MAP_SIZE;
+    const reach = this.roadReach;
+    reach.fill(0);
+    this.roadGrid.fill(0);
+    for (const b of this.buildings) if (b.type === "road" && b.built) this.roadGrid[this.idx(b.x, b.y)] = 1;
+    this.hubs = this.buildings.filter((b) => b.built && BUILDINGS[b.type].hub && !!b.physical);
+    const queue: number[] = [];
+    for (const b of this.hubs) for (const [ax, ay] of roadAccess(this, b)) { const i = this.idx(ax, ay); if (!reach[i]) { reach[i] = 1; queue.push(i); } }
+    while (queue.length) {
+      const i = queue.pop()!;
+      const x = i % N, y = (i / N) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (!this.inb(nx, ny)) continue;
+        const ni = this.idx(nx, ny);
+        if (!reach[ni] && this.roadGrid[ni]) { reach[ni] = 1; queue.push(ni); }
+      }
+    }
+    for (const b of this.buildings) {
+      const def = BUILDINGS[b.type];
+      if (b.type === "road") b.connected = !!reach[this.idx(b.x, b.y)];
+      else if (def.hub && b.built) b.connected = true;
+      else if (b.type === "field") b.connected = false;
+      else b.connected = buildingAccess(b).some(([ax, ay]) => !!reach[this.idx(ax, ay)]);
+      const s = this.computeSite(b.type, b.x, b.y);
+      b.site = s.factor;
+      b.mineRes = s.mineRes;
+    }
+    let storage = 0;
+    for (const b of this.buildings) if (b.built) storage += BUILDINGS[b.type].storage ?? 0;
+    let mult = 1;
+    for (const id of this.research.done) {
+      const t = TECHS.find((x) => x.id === id);
+      if (t?.effect.kind === "storage") mult += t.effect.mult;
+    }
+    for (const r of RES_IDS) this.limit[r] = Math.round((RESOURCES[r].limit + storage) * mult);
+    this.pathVersion++;
+    this.dirtyFlag = false;
+    syncRes(this);
+  }
+
+  techProdMult(type: BuildingId): number {
+    let m = 0;
+    for (const id of this.research.done) {
+      const t = TECHS.find((x) => x.id === id);
+      if (t?.effect.kind === "prod" && t.effect.buildings.includes(type)) m += t.effect.mult;
+    }
+    return m;
+  }
+  private hasTech(kind: "trade" | "drill"): boolean {
+    return this.research.done.some((id) => TECHS.find((t) => t.id === id)?.effect.kind === kind);
+  }
+
+  /** Bevölkerungskapazität, Arbeitsplätze (aus dem endlichen Bestand) und Militärstärke ableiten */
+  computeStats() {
+    let cap = 0;
+    for (const b of this.buildings) { const def = BUILDINGS[b.type]; if (b.built && def.housing && b.connected) cap += def.housing; }
+    this.popCap = cap;
+    this.workforce = Math.floor(Math.floor(this.pop) * POPULATION.workerShare);
+    for (const j of JOB_IDS) this.byJob[j] = { needed: 0, filled: 0 };
+    const sites = this.buildings.filter((b) => !b.built && !isInstant(b) && b.connected).length;
+    let remaining = this.workforce;
+    let mil = Math.floor(this.soldiers) * 2;
+    for (const b of this.buildings) {
+      b.workers = 0; b.crew = {};
+      if (!b.built) continue;
+      const def = BUILDINGS[b.type];
+      const list: [JobId, number][] = [];
+      if (def.jobs) list.push([def.jobs.job, this.slotsOf(b)]);
+      for (const [job, n] of Object.entries(def.crew ?? {}) as [JobId, number][]) list.push([job, job === "baumeister" ? Math.min(n, sites * CONSTRUCTION.buildersPerSite) : n]);
+      for (const [job, n] of list) {
+        this.byJob[job].needed += n;
+        if (def.needsRoad && !b.connected) continue;
+        const w = Math.min(n, remaining);
+        if (w > 0) { b.crew[job] = w; b.workers += w; remaining -= w; this.byJob[job].filled += w; }
+      }
+      if (def.military && def.jobs) { const slots = this.slotsOf(b); mil += def.military * ((b.crew[def.jobs.job] ?? 0) / Math.max(1, slots)); }
+    }
+    this.military = Math.round(mil);
+  }
+
+  /* ============================================================= Simulation */
+
+  /** Pro Frame aufrufen. dt in Sekunden. */
+  update(dt: number) {
+    if (this.simulationSpeed === 0) return;
+    dt *= this.simulationSpeed;
+    dt = Math.min(dt, 0.5);
     this.clock += dt;
-    if (this.state !== 'paused') this.update(dt);
-    this.render();
-    this.raf = requestAnimationFrame(this.loop);
-  };
+    this.playTime += dt;
+    this.toasts = this.toasts.filter((t) => this.clock - t.t < 5);
+    this.acc += dt;
+    let guard = 0;
+    while (this.acc >= SIM_STEP && guard++ < 6) { this.acc -= SIM_STEP; this.step(SIM_STEP); }
+    if (this.acc > SIM_STEP) this.acc = 0;
+    this.notifyAcc += dt;
+    if (this.notifyAcc >= 0.25) { this.notifyAcc = 0; this.notify(); }
+  }
 
-  private update(dt: number) {
-    // Hintergrund
-    const scroll = this.state === 'playing' ? 1 : 0.5;
-    this.nebulaY = (this.nebulaY + 22 * dt * scroll) % H;
-    for (const s of this.stars) {
-      s.y += (25 + s.z * 150) * dt * scroll;
-      if (s.y > H) {
-        s.y -= H;
-        s.x = rand(0, W);
+  /** Headless: Simulation um `seconds` vorspulen (Tests) */
+  simulate(seconds: number) { for (let t = 0; t < seconds; t += SIM_STEP) this.update(SIM_STEP); }
+
+  private step(dt: number) {
+    if (this.dirtyFlag) this.recompute();
+    this.physicalClock += dt;
+    this.computeStats();
+    syncPopulation(this);
+    assignHomes(this);
+    assignWorkplaces(this);
+    this.indexWorkers();
+    const flowP = this.flowProd, flowC = this.flowCons;
+
+    updateTrees(this, dt);
+    updateFields(this, dt);
+    updateResidents(this, dt);
+    updateProcessors(this, dt);
+    updateConstruction(this, dt);
+    if (this.dirtyFlag) { this.recompute(); this.computeStats(); }
+    planTransports(this);
+    updateOrders(this, dt);
+    this.updateStatuses();
+    const barracks = this.count("barracks");
+
+    /* ---- Kaserne (Dienstleistung, entnimmt Brot/Werkzeuge aus den Hubs) ---- */
+    for (const b of this.buildings) {
+      const def = BUILDINGS[b.type];
+      if (!b.built || def.recipe?.special !== "soldier" || b.status !== "ok") continue;
+      const slots = Math.max(1, this.slotsOf(b));
+      let eff = ((b.crew.soldat ?? 0) / slots) * (this.hasTech("drill") ? 2 : 1);
+      b.eff = eff;
+      const cap = Math.min(barracks * SOLDIERS_PER_BARRACKS, Math.floor(this.pop * 0.5));
+      let cycles = Math.min((eff * dt) / def.recipe.cycle, Math.max(0, cap - this.soldiers));
+      for (const [r, n] of Object.entries(def.recipe.inputs) as [ResId, number][]) { const avail = this.getSpendableResource(r) / n; if (avail < cycles) { cycles = avail; b.missing = r; b.status = "no_input"; } }
+      if (cycles <= 0) { eff = 0; continue; }
+      for (const [r, n] of Object.entries(def.recipe.inputs) as [ResId, number][]) { this.consumeResource(r, n * cycles); flowC[r] += n * cycles; }
+      this.soldiers += cycles;
+    }
+
+    /* ---- Bevölkerung: Verbrauch + Wachstum (Nahrung wird aus den Hubs entnommen) ---- */
+    const need = (Math.floor(this.pop) * POPULATION.foodPerCapitaPerMin * dt) / 60;
+    let fed = 1, usedBrot = 0;
+    if (need > 0) {
+      usedBrot = Math.min(this.getSpendableResource("brot"), need);
+      const usedGrain = Math.min(this.getSpendableResource("getreide"), need - usedBrot);
+      this.consumeResource("brot", usedBrot); this.consumeResource("getreide", usedGrain);
+      flowC.brot += usedBrot; flowC.getreide += usedGrain;
+      fed = (usedBrot + usedGrain) / need;
+    }
+    this.foodStatus = fed >= 0.98 ? "ok" : fed > 0.4 ? "low" : "starving";
+    const perMin = (0.8 + 0.08 * this.pop) * (usedBrot > 0 ? 1.5 : 1);
+    this.growthPerMin = 0;
+    if (this.foodStatus === "ok" && this.pop < this.popCap) { this.growthPerMin = perMin; this.pop = Math.min(this.popCap, this.pop + (perMin * dt) / 60); }
+    else if (this.foodStatus === "starving" && this.pop > 2) { this.growthPerMin = -0.6; this.pop = Math.max(2, this.pop - (0.6 * dt) / 60); }
+    if (this.pop > this.popCap + 0.5) { this.pop = Math.max(this.popCap, this.pop - dt / 60); this.growthPerMin = -1; }
+    if (this.soldiers > this.pop * 0.5) this.soldiers = Math.max(0, this.pop * 0.5);
+    syncPopulation(this); // Einwohner-Entitäten folgen sofort der Bevölkerungszahl
+
+    /* ---- Raten glätten (gleitender Mittelwert pro Minute) ---- */
+    for (const r of RES_IDS) {
+      this.prod[r] += ((flowP[r] / dt) * 60 - this.prod[r]) * 0.12;
+      this.cons[r] += ((flowC[r] / dt) * 60 - this.cons[r]) * 0.12;
+      flowP[r] = 0; flowC[r] = 0;
+    }
+
+    /* ---- Forschung ---- */
+    const act = this.research.active;
+    if (act) {
+      act.remaining -= dt;
+      if (act.remaining <= 0) {
+        const t = TECHS.find((x) => x.id === act.id)!;
+        this.research.done.push(t.id);
+        this.research.active = null;
+        this.toast(`Erforscht: ${t.name}`, "good");
+        this.addXp(40 + t.minLevel * 6);
+        this.dirtyFlag = true;
       }
     }
-    if (this.state === 'menu') {
-      this.updateEffects(dt);
-      return;
-    }
-    if (this.state !== 'playing' && this.state !== 'over') return;
+    syncRes(this);
+    this.computeStats();
+    this.checkQuests();
+  }
 
-    const p = this.p;
-    const sdt = p.alive ? dt : dt * 0.4;
-    if (p.alive) this.time += dt;
-
-    this.shake = Math.max(0, this.shake - 40 * sdt);
-    this.flash = Math.max(0, this.flash - 1.6 * sdt);
-    if (this.comboT > 0) {
-      this.comboT -= sdt;
-      if (this.comboT <= 0) this.combo = 0;
+  /** Gebäudestatus für HUD/Inspektor aus dem physischen Zustand ableiten */
+  private updateStatuses() {
+    for (const b of this.buildings) {
+      const def = BUILDINGS[b.type];
+      if (!b.built) { b.status = "constructing"; continue; }
+      if (def.recipe?.special) { b.status = def.needsRoad && !b.connected ? "no_road" : b.workers <= 0 ? "no_workers" : "ok"; b.missing = null; continue; }
+      if (def.needsRoad && !b.connected && def.id !== "road") { b.status = "no_road"; continue; }
+      if (def.jobs && b.workers <= 0) { b.status = "no_workers"; continue; }
+      if (def.site && def.site.kind !== "fields" && b.site <= 0) { b.status = "no_site"; continue; }
+      b.status = "ok";
+      if (b.type === "mine" || b.type === "quarry") { if (depositInfo(this, b).remaining <= 0) { b.status = "depleted"; continue; } }
+      const p = b.physical;
+      if (!p) continue;
+      if (this.isProcessor(b)) {
+        b.status = p.production === "WAITING_FOR_INPUT" ? "no_input" : p.production === "WAITING_FOR_PICKUP" ? "storage_full" : p.production === "NO_WORKER" ? "no_workers" : "ok";
+      } else if (!isHub(b)) {
+        for (const r of Object.keys(p.output) as ResId[]) if (getStored(b, "output", r) >= getCapacity(this, b, "output", r) - 1e-9 && getCapacity(this, b, "output", r) > 0) b.status = "storage_full";
+      }
     }
-    if (this.banner) {
-      this.banner.t -= sdt;
-      if (this.banner.t <= 0) this.banner = null;
-    }
+  }
 
-    if (this.state === 'playing') {
-      if (p.alive) this.updatePlayer(dt);
-      this.updateWaves(sdt);
-      this.updateEnemies(sdt);
-      this.updateBullets(sdt);
-      this.collide();
-      this.updatePickups(sdt);
+  /* ============================================================ Level / XP */
+
+  addXp(n: number) {
+    this.xp += n;
+    while (this.xp >= xpToNext(this.level)) {
+      this.xp -= xpToNext(this.level);
+      this.level++;
+      const unlocked = LEVEL_UNLOCKS.find((u) => u.level === this.level);
+      const newB = Object.values(BUILDINGS).filter((b) => b.unlock === this.level).map((b) => b.name);
+      this.toast(`Level ${this.level}!${unlocked ? ` ${unlocked.name} freigeschaltet.` : ""}${newB.length ? ` Neu: ${newB.join(", ")}` : ""}`, "level");
+    }
+  }
+
+  /* ============================================================== Aufgaben */
+
+  questProgress(qd: QuestDef): { cur: number; target: number } {
+    const c = qd.cond;
+    switch (c.type) {
+      case "build": return { cur: Math.min(c.count, this.count(c.building)), target: c.count };
+      case "pop": return { cur: Math.min(c.n, Math.floor(this.pop)), target: c.n };
+      case "stock": return { cur: Math.min(c.n, Math.floor(this.getTotalResource(c.res))), target: c.n };
+      case "level": return { cur: Math.min(c.n, this.level), target: c.n };
+      case "prod": return { cur: Math.min(c.n, Math.round(this.prod[c.res] * 10) / 10), target: c.n };
+      case "military": return { cur: Math.min(c.n, this.military), target: c.n };
+      case "research": return { cur: Math.min(c.n, this.research.done.length), target: c.n };
+      case "trade": return { cur: Math.min(c.n, this.tradeCount), target: c.n };
+    }
+  }
+
+  activeQuests(max = 5): QuestDef[] {
+    return QUESTS.filter((q) => !this.questsDone.includes(q.id) && q.minLevel <= this.level).slice(0, max);
+  }
+
+  private checkQuests() {
+    for (const qd of this.activeQuests(8)) {
+      const p = this.questProgress(qd);
+      if (p.cur >= p.target) {
+        this.questsDone.push(qd.id);
+        for (const [r, n] of Object.entries(qd.reward ?? {}) as [ResId, number][]) this.depositResource(r, n);
+        this.toast(`Aufgabe erfüllt: ${qd.title} (+${qd.xp} EP)`, "good");
+        this.addXp(qd.xp);
+      }
+    }
+  }
+
+  /* ========================================================= Forschung/Handel */
+
+  canResearch(id: string): string | null {
+    const t = TECHS.find((x) => x.id === id);
+    if (!t) return "Unbekannt";
+    if (this.research.done.includes(id)) return "Bereits erforscht";
+    if (this.research.active) return "Es wird bereits geforscht";
+    if (this.level < t.minLevel) return `Ab Level ${t.minLevel}`;
+    for (const [r, n] of Object.entries(t.cost) as [ResId, number][]) if (this.getSpendableResource(r) < n) return `Nicht genug ${RESOURCES[r].name}`;
+    return null;
+  }
+
+  startResearch(id: string): boolean {
+    const why = this.canResearch(id);
+    if (why) { this.toast(why, "warn"); this.notify(); return false; }
+    const t = TECHS.find((x) => x.id === id)!;
+    this.consumeCost(t.cost);
+    this.research.active = { id, remaining: t.time };
+    this.toast(`Forschung gestartet: ${t.name}`, "info");
+    this.notify();
+    return true;
+  }
+
+  marketActive(): boolean { return this.buildings.some((b) => b.type === "market" && b.built && b.connected && b.workers > 0); }
+  tradePrice(res: ResId, mode: "buy" | "sell"): number {
+    const d = this.hasTech("trade") ? 0.15 : 0;
+    const base = RESOURCES[res].price;
+    return mode === "buy" ? base * 1.4 * (1 - d) : base * 0.7 * (1 + d);
+  }
+  trade(res: ResId, amount: number, mode: "buy" | "sell"): string | null {
+    if (res === "gold") return "Gold ist die Handelswährung.";
+    if (!this.marketActive()) return "Kein besetzter Marktplatz vorhanden.";
+    const unit = this.tradePrice(res, mode);
+    if (mode === "sell") {
+      const n = Math.min(amount, Math.floor(this.getSpendableResource(res)));
+      if (n <= 0) return `Kein ${RESOURCES[res].name} im Lager.`;
+      const gain = Math.floor(unit * n);
+      if (gain <= 0) return "Menge zu klein.";
+      this.consumeResource(res, n);
+      this.depositResource("gold", gain);
     } else {
-      this.updateBullets(sdt);
+      let free = 0;
+      for (const h of this.hubs) free += getAvailableInputCapacity(this, h, res);
+      const n = Math.min(amount, Math.floor(free));
+      if (n <= 0) return "Lager voll.";
+      const cost = Math.ceil(unit * n);
+      if (!this.consumeResource("gold", cost)) return "Nicht genug Gold.";
+      this.depositResource(res, n);
     }
-    this.updateEffects(sdt);
-
-    this.enemies = this.enemies.filter((e) => !e.dead);
-    this.bullets = this.bullets.filter((b) => !b.dead);
-
-    if (!p.alive && this.state === 'playing') {
-      this.deathT -= dt;
-      if (this.deathT <= 0) this.finish();
-    }
+    this.tradeCount++;
+    this.notify();
+    return null;
   }
 
-  private updatePlayer(dt: number) {
-    const p = this.p;
-    const k = this.keys;
-    let dx = 0;
-    let dy = 0;
-    if (k.has('ArrowLeft') || k.has('KeyA')) dx -= 1;
-    if (k.has('ArrowRight') || k.has('KeyD')) dx += 1;
-    if (k.has('ArrowUp') || k.has('KeyW')) dy -= 1;
-    if (k.has('ArrowDown') || k.has('KeyS')) dy += 1;
-    if (dx || dy) {
-      const l = Math.hypot(dx, dy);
-      const sp = 330;
-      p.x += (dx / l) * sp * dt;
-      p.y += (dy / l) * sp * dt;
-      this.tx = p.x;
-      this.ty = p.y;
-      this.baseX = p.x;
-      this.baseY = p.y;
-      if (this.pointer.active) this.pointer.active = false;
-    } else if (this.pointer.active) {
-      const f = 1 - Math.pow(0.0005, dt);
-      p.x += (this.tx - p.x) * f;
-      p.y += (this.ty - p.y) * f;
-    }
-    p.x = clamp(p.x, 18, W - 18);
-    p.y = clamp(p.y, H * 0.22, H - 50);
-    if (!this.pointer.active) {
-      this.baseX = p.x;
-      this.baseY = p.y;
-      this.tx = p.x;
-      this.ty = p.y;
-    }
+  /* ========================================================== Auswertungen */
 
-    p.invuln = Math.max(0, p.invuln - dt);
-    p.shield = Math.max(0, p.shield - dt);
-
-    p.fireCd -= dt;
-    if (p.fireCd <= 0) {
-      this.playerFire();
-      p.fireCd = p.weapon >= 5 ? 0.12 : 0.15;
-    }
-
-    // Triebwerk
-    if (Math.random() < 0.8 && this.parts.length < 700) {
-      this.parts.push({
-        x: p.x + rand(-3, 3),
-        y: p.y + 16,
-        vx: rand(-14, 14),
-        vy: rand(120, 200),
-        life: 0.3,
-        max: 0.3,
-        size: rand(1.5, 3),
-        color: Math.random() < 0.5 ? '#ffb347' : '#4cc9f0',
-        glow: true,
-      });
-    }
+  depositInfo(b: Building) { return depositInfo(this, b); }
+  treeStage(i: number) { return treeStage(this, i); }
+  siteInfo(b: Building) { return b.built ? null : { state: siteState(this, b), materials: materialFraction(b), required: constructionMaterials(b.type) }; }
+  cancelTransport(id: number): boolean { const ok = cancelOrder(this, id); if (ok) this.notify(); return ok; }
+  /** Aufträge, die ein Gebäude betreffen (aktiv + zuletzt abgeschlossene) */
+  ordersOf(id: number): TransportOrder[] {
+    return [...this.transportArchive.filter((o) => o.sourceBuildingId === id || o.targetBuildingId === id).slice(-2), ...this.transportOrders.filter((o) => o.sourceBuildingId === id || o.targetBuildingId === id).slice(0, 4)];
   }
 
-  private updateWaves(dt: number) {
-    if (this.wave === 0) return;
-    this.waveT += dt;
-    while (this.queue.length && this.queue[0].t <= this.waveT) {
-      const s = this.queue.shift()!;
-      this.spawnEnemy(s.kind, s.x, s.dir);
-      if (s.kind === 'boss') this.sfx.phase();
+  /** Verbrauchs-/Produktionsraten eines Verarbeiters (pro Minute) bei aktueller Effizienz */
+  buildingRates(b: Building): { inputs: [ResId, number][]; outputs: [ResId, number][] } {
+    const def = BUILDINGS[b.type];
+    if (!def.recipe || !b.built) return { inputs: [], outputs: [] };
+    const f = (60 / def.recipe.cycle) * Math.max(b.eff, 0);
+    return {
+      inputs: (Object.entries(def.recipe.inputs) as [ResId, number][]).map(([r, n]) => [r, n * f]),
+      outputs: (Object.entries(def.recipe.outputs) as [ResId, number][]).map(([r, n]) => [r, n * f]),
+    };
+  }
+
+  /** Engpass-Analyse für die Wirtschaftsübersicht */
+  bottlenecks(): Bottleneck[] {
+    const out: Bottleneck[] = [];
+    const groups = new Map<string, { def: BuildingDef; status: BStatus; n: number; missing: ResId | null }>();
+    for (const b of this.buildings) {
+      if (b.status === "ok" || b.status === "constructing") continue;
+      const key = `${b.type}|${b.status}|${b.missing ?? ""}`;
+      const g = groups.get(key);
+      if (g) g.n++;
+      else groups.set(key, { def: BUILDINGS[b.type], status: b.status, n: 1, missing: b.missing });
     }
-    if (this.waveDelay > 0) {
-      this.waveDelay -= dt;
-      if (this.waveDelay <= 0) this.startWave(this.wave + 1);
-    } else if (!this.queue.length && !this.enemies.some((e) => !e.dead)) {
-      this.waveDelay = 3;
-      const bonus = this.wave * 250;
-      this.score += bonus;
-      if (this.wave % 5 !== 0) {
-        this.banner = { text: `WELLE ${this.wave} GESCHAFFT`, sub: `Bonus +${bonus}`, t: 2.6, max: 2.6, color: '#9dffb0' };
-        this.sfx.wave();
+    groups.forEach((g) => {
+      const miss = g.missing ? `: ${RESOURCES[g.missing].name} fehlt` : "";
+      out.push({ sev: g.status === "no_input" || g.status === "no_site" || g.status === "no_road" ? "bad" : "warn", text: `${g.n}× ${g.def.name} – ${STATUS_TEXT[g.status].label}${miss}` });
+    });
+    if (this.foodStatus !== "ok") out.push({ sev: "bad", text: this.foodStatus === "starving" ? "Die Bevölkerung hungert! Brot/Getreide fehlt." : "Nahrung reicht nicht für alle." });
+    const unfilled = JOB_IDS.reduce((s, j) => s + Math.max(0, this.byJob[j].needed - this.byJob[j].filled), 0);
+    if (unfilled >= 1) out.push({ sev: "warn", text: `${Math.round(unfilled)} Arbeitsplätze unbesetzt – mehr Wohnraum/Einwohner nötig.` });
+    if (this.pop >= this.popCap - 0.5 && this.popCap > 0 && this.foodStatus === "ok") out.push({ sev: "warn", text: "Wohnraum voll – baue weitere Häuser." });
+    const lg = this.logistics();
+    if (lg.waiting > Math.max(2, lg.carriers)) out.push({ sev: "warn", text: `Träger-Engpass: ${lg.waiting} Transporte warten, nur ${lg.carriers} Träger (Lagerhaus ausbauen / mehr Einwohner).` });
+    if (lg.blockedRoute > 0) out.push({ sev: "bad", text: `${lg.blockedRoute} Transport(e) ohne Straßenverbindung blockiert.` });
+    for (const b of this.buildings) if (!b.built && !isInstant(b) && b.siteState === "NO_ROAD") { out.push({ sev: "bad", text: `Baustelle ${BUILDINGS[b.type].name}: keine Straßenanbindung für Material.` }); break; }
+    for (const r of RES_IDS) {
+      if (this.res[r] < 1 && this.cons[r] > 0.05) out.push({ sev: "bad", text: `${RESOURCES[r].name}: Bestand leer (Verbrauch ${this.cons[r].toFixed(1)}/min)` });
+      else if (this.res[r] >= this.limit[r] * 0.98 && this.prod[r] > 0.05) out.push({ sev: "warn", text: `${RESOURCES[r].name}: Lager voll – Lagerhaus bauen oder verarbeiten.` });
+    }
+    return out;
+  }
+
+  get jobsSummary() { return JOB_IDS.map((j) => ({ id: j, name: JOBS[j].name, icon: JOBS[j].icon, ...this.byJob[j] })); }
+  get nextXp() { return xpToNext(this.level); }
+
+  /* ================================================================ Audit */
+
+  /**
+   * Prüft die Invarianten der physischen Simulation und liefert Verstöße (leer = konsistent):
+   * keine negativen/überlaufenden Lager, keine verwaisten Reservierungen, endliche Einwohner, Kapazität von Wohnungen.
+   */
+  audit(): string[] {
+    const bad: string[] = [];
+    const expOut = new Map<number, Partial<Record<ResId, number>>>(), expIn = new Map<number, Partial<Record<ResId, number>>>();
+    for (const o of this.transportOrders) {
+      if (o.srcReserved && o.sourceBuildingId !== null) { const m = expOut.get(o.sourceBuildingId) ?? {}; m[o.resource] = (m[o.resource] ?? 0) + o.amount; expOut.set(o.sourceBuildingId, m); }
+      if (o.dstReserved && o.targetBuildingId !== null) { const m = expIn.get(o.targetBuildingId) ?? {}; m[o.resource] = (m[o.resource] ?? 0) + o.amount; expIn.set(o.targetBuildingId, m); }
+    }
+    for (const b of this.buildings) {
+      const p = b.physical;
+      if (!p) continue;
+      for (const [side, s] of [["input", p.input], ["output", p.output]] as const) for (const r of RES_IDS) {
+        const n = amountOf(s, r);
+        if ((s[r] ?? 0) < -1e-9) bad.push(`#${b.id} ${b.type} ${side} ${r} negativ`);
+        if (!isHub(b) && n > getCapacity(this, b, side, r) + 1e-6 && !(side === "output" && !b.built)) bad.push(`#${b.id} ${b.type} ${side} ${r} über Kapazität (${n})`);
       }
-      // kleine Heilung
-      this.p.hp = Math.min(this.p.maxHp, this.p.hp + 8);
-    }
-  }
-
-  private updateEnemies(dt: number) {
-    const p = this.p;
-    const f = this.diff.fire;
-    for (let i = 0; i < this.enemies.length; i++) {
-      const e = this.enemies[i];
-      if (e.dead) continue;
-      e.t += dt;
-      e.flash = Math.max(0, e.flash - dt);
-      switch (e.kind) {
-        case 'scout': {
-          e.y += e.vy * dt;
-          e.x = clamp(e.baseX + Math.sin(e.t * 2.2) * 70, 16, W - 16);
-          if (this.wave >= 3 && p.alive) {
-            e.cd -= dt;
-            if (e.cd <= 0 && e.y > 30 && e.y < H * 0.6) {
-              e.cd = rand(2.5, 4.5) / f;
-              this.eShoot(e.x, e.y + 10, this.aim(e.x, e.y), 210, 's');
-            }
-          }
-          break;
-        }
-        case 'zig': {
-          e.x += e.dir * e.vx * dt;
-          if (e.x < 24) e.dir = 1;
-          if (e.x > W - 24) e.dir = -1;
-          e.y += e.vy * dt;
-          if (this.wave >= 2 && p.alive) {
-            e.cd -= dt;
-            if (e.cd <= 0 && e.y > 30 && e.y < H * 0.65) {
-              e.cd = rand(1.6, 2.6) / f;
-              this.eShoot(e.x, e.y + 12, Math.PI / 2, 230, 's');
-            }
-          }
-          break;
-        }
-        case 'tank': {
-          e.y += e.vy * dt;
-          e.x += Math.sin(e.t * 0.8) * 20 * dt;
-          if (p.alive) {
-            e.cd -= dt;
-            if (e.cd <= 0 && e.y > 20 && e.y < H * 0.7) {
-              e.cd = 2.1 / f;
-              const a = this.aim(e.x, e.y);
-              for (let k = -1; k <= 1; k++) this.eShoot(e.x, e.y + 14, a + k * 0.22, 200, 'b');
-            }
-          }
-          break;
-        }
-        case 'kamikaze': {
-          if (p.alive && e.y > 40) {
-            const want = this.aim(e.x, e.y);
-            let d = want - e.angle;
-            while (d > Math.PI) d -= Math.PI * 2;
-            while (d < -Math.PI) d += Math.PI * 2;
-            e.angle += clamp(d, -2.3 * dt, 2.3 * dt);
-          }
-          e.x += Math.cos(e.angle) * e.vy * dt;
-          e.y += Math.sin(e.angle) * e.vy * dt;
-          if (e.t > 9) e.y = H + 100;
-          if (this.parts.length < 700 && Math.random() < 0.6) {
-            this.parts.push({
-              x: e.x - Math.cos(e.angle) * 12,
-              y: e.y - Math.sin(e.angle) * 12,
-              vx: rand(-20, 20),
-              vy: rand(-20, 20),
-              life: 0.25,
-              max: 0.25,
-              size: 2.2,
-              color: '#ff8c42',
-              glow: true,
-            });
-          }
-          break;
-        }
-        case 'shooter': {
-          if (e.t < 12) {
-            if (e.y < e.cd2) e.y += e.vy * dt;
-            else {
-              e.x += e.dir * e.vx * dt;
-              if (e.x < 40) e.dir = 1;
-              if (e.x > W - 40) e.dir = -1;
-            }
-          } else {
-            e.y += 160 * dt;
-          }
-          if (p.alive && e.y >= e.cd2 - 5 && e.t < 12) {
-            e.cd -= dt;
-            if (e.cd <= 0) {
-              e.cd = 2.2 / f;
-              const a = this.aim(e.x, e.y);
-              for (let k = -2; k <= 2; k++) this.eShoot(e.x, e.y + 14, a + k * 0.28, 185, 's', '#c77dff');
-            }
-          }
-          break;
-        }
-        case 'boss':
-          this.updateBoss(e, dt);
-          break;
-      }
-      if (e.kind !== 'boss' && (e.y > H + 60 || e.x < -80 || e.x > W + 80)) e.dead = true;
-    }
-  }
-
-  private updateBoss(e: Enemy, dt: number) {
-    const b = e.bossType;
-    const f = this.diff.fire;
-    const p = this.p;
-    if (!e.entered) {
-      e.y += 70 * dt;
-      if (e.y >= 110) {
-        e.y = 110;
-        e.entered = true;
-        e.cd = 1;
-      }
-      return;
-    }
-    const hpf = e.hp / e.maxHp;
-    const phase = hpf > 0.66 ? 0 : hpf > 0.33 ? 1 : 2;
-    if (phase !== e.phase) {
-      e.phase = phase;
-      this.sfx.phase();
-      this.shake = 14;
-      this.rings.push({ x: e.x, y: e.y, r: 20, max: 300, life: 0.7, max_life: 0.7, color: '#ff4d6d', width: 6 });
-      this.banner = { text: phase === 1 ? 'PHASE 2' : 'RASEREI!', sub: BOSS_NAMES[b], t: 1.6, max: 1.6, color: '#ff4d6d' };
-      for (const bl of this.bullets) if (!bl.friendly) bl.dead = true;
-    }
-    const amp = W / 2 - e.r - 14;
-    e.x = W / 2 + Math.sin(e.t * (0.55 + 0.22 * phase + 0.08 * b)) * amp;
-    e.y = 110 + Math.sin(e.t * 1.3) * 12;
-    if (!p.alive) return;
-
-    const col = ['#c77dff', '#72efdd', '#ffa62b'][b];
-    // Salven
-    e.cd -= dt;
-    if (e.cd <= 0) {
-      if (phase < 2) {
-        e.cd = (phase === 0 ? 1.5 : 1.9) / f;
-        const n = 3 + b * 2 + phase * 2;
-        const origins = b === 1 ? [-40, 0, 40] : [0];
-        for (const ox of origins) {
-          const a = this.aim(e.x + ox, e.y);
-          for (let k = 0; k < n; k++) {
-            this.eShoot(e.x + ox, e.y + e.r * 0.6, a + (k - (n - 1) / 2) * 0.17, 235, 's', col);
-          }
-        }
-      } else {
-        e.cd = 2.2 / f;
-        const n = 14 + b * 4;
-        const off = rand(0, Math.PI * 2);
-        for (let k = 0; k < n; k++) this.eShoot(e.x, e.y + 10, off + (k / n) * Math.PI * 2, 170, 'b', col);
+      for (const r of RES_IDS) {
+        if (Math.abs(amountOf(p.reservedOutput, r) - amountOf(expOut.get(b.id) ?? {}, r)) > 1e-6) bad.push(`#${b.id} ${b.type} verwaiste Ausgangsreservierung ${r}`);
+        if (Math.abs(amountOf(p.reservedInput, r) - amountOf(expIn.get(b.id) ?? {}, r)) > 1e-6) bad.push(`#${b.id} ${b.type} verwaiste Eingangsreservierung ${r}`);
+        if (amountOf(p.reservedOutput, r) > getStored(b, "output", r) + 1e-6) bad.push(`#${b.id} ${b.type} mehr Reservierung als Bestand ${r}`);
       }
     }
-    // Spirale
-    if (phase >= 1) {
-      e.cd2 -= dt;
-      if (e.cd2 <= 0) {
-        e.cd2 = (phase === 1 ? 0.15 : 0.1) / f;
-        e.angle += 0.33;
-        this.eShoot(e.x, e.y + 10, e.angle, 160, 's', col);
-        if (phase === 2 || b === 1) this.eShoot(e.x, e.y + 10, e.angle + Math.PI, 160, 's', col);
-        if (b === 2 && phase === 2) {
-          this.eShoot(e.x, e.y + 10, e.angle + Math.PI / 2, 160, 's', col);
-          this.eShoot(e.x, e.y + 10, e.angle - Math.PI / 2, 160, 's', col);
-        }
-      }
-    }
-    // Verstärkung
-    if (phase === 2) {
-      e.cd3 -= dt;
-      if (e.cd3 <= 0) {
-        e.cd3 = 7;
-        const k1 = this.spawnEnemy('kamikaze', e.x - 40);
-        const k2 = this.spawnEnemy('kamikaze', e.x + 40);
-        k1.y = e.y + 20;
-        k2.y = e.y + 20;
-      }
-    }
+    if (this.residents.length !== Math.floor(this.pop)) bad.push(`Einwohnerzahl ${this.residents.length} ≠ Bevölkerung ${Math.floor(this.pop)}`);
+    const live = new Set(this.residents.map((r) => r.id));
+    for (const o of this.transportOrders) if (o.carrierId !== null && !live.has(o.carrierId)) bad.push(`Auftrag #${o.id} ohne lebenden Träger`);
+    const homeUse = new Map<number, number>();
+    for (const r of this.residents) if (r.homeBuildingId !== null) homeUse.set(r.homeBuildingId, (homeUse.get(r.homeBuildingId) ?? 0) + 1);
+    for (const [id, n] of homeUse) { const h = this.getBuilding(id); if (!h || n > (BUILDINGS[h.type].housing ?? 0)) bad.push(`Haus #${id} überbelegt (${n})`); }
+    const work = new Map<string, number>();
+    for (const r of this.residents) if (r.workplaceId !== null) work.set(`${r.workplaceId}|${r.job}`, (work.get(`${r.workplaceId}|${r.job}`) ?? 0) + 1);
+    for (const [k, n] of work) { const [id, job] = k.split("|"); const b = this.getBuilding(Number(id)); if (!b) bad.push(`Arbeitsplatz #${id} existiert nicht`); else if (n > (b.crew[job as JobId] ?? 0) + 2) bad.push(`Arbeitsplatz #${id} ${job} überbesetzt (${n})`); }
+    if (this.transportOrders.some((o) => !ACTIVE_STATUSES.includes(o.status))) bad.push("Abgeschlossene Aufträge im aktiven Array");
+    if (this.transportArchive.length > TRANSPORT.archiveSize) bad.push("Archiv wächst unbegrenzt");
+    return bad;
   }
 
-  private updateBullets(dt: number) {
-    for (const b of this.bullets) {
-      b.x += b.vx * dt;
-      b.y += b.vy * dt;
-      if (b.x < -30 || b.x > W + 30 || b.y < -40 || b.y > H + 30) b.dead = true;
-    }
-  }
-
-  private collide() {
-    const p = this.p;
-    // Spieler-Schüsse gegen Gegner
-    for (const b of this.bullets) {
-      if (b.dead || !b.friendly) continue;
-      for (const e of this.enemies) {
-        if (e.dead) continue;
-        const dx = b.x - e.x;
-        const dy = b.y - e.y;
-        const rr = b.r + e.r;
-        if (dx * dx + dy * dy < rr * rr) {
-          b.dead = true;
-          if (e.kind === 'boss' && !e.entered) {
-            this.spark(b.x, b.y, '#ffffff', 2, 80);
-          } else {
-            this.spark(b.x, b.y, '#bff6ff', 3, 110);
-            this.hitEnemy(e, b.dmg);
-          }
-          break;
-        }
-      }
-    }
-    if (!p.alive) return;
-    // Gegner-Schüsse gegen Spieler
-    for (const b of this.bullets) {
-      if (b.dead || b.friendly) continue;
-      const dx = b.x - p.x;
-      const dy = b.y - p.y;
-      const rr = b.r + p.hit;
-      if (dx * dx + dy * dy < rr * rr) {
-        b.dead = true;
-        this.hurt(b.dmg);
-        if (!p.alive) return;
-      }
-    }
-    // Gegner gegen Spieler
-    for (const e of this.enemies) {
-      if (e.dead) continue;
-      const dx = e.x - p.x;
-      const dy = e.y - p.y;
-      const rr = e.r * 0.85 + p.hit;
-      if (dx * dx + dy * dy < rr * rr) {
-        if (this.hurt(25 * this.diff.dmg)) {
-          if (e.kind !== 'boss') this.hitEnemy(e, 8);
-          if (!p.alive) return;
-        }
-      }
-    }
-  }
-
-  private updatePickups(dt: number) {
-    const p = this.p;
-    for (const k of this.pickups) {
-      k.t += dt;
-      k.y += 85 * dt;
-      if (p.alive) {
-        const dx = p.x - k.x;
-        const dy = p.y - k.y;
-        const d = Math.hypot(dx, dy);
-        if (d < 110) {
-          k.x += (dx / d) * 220 * dt;
-          k.y += (dy / d) * 220 * dt;
-        }
-        if (d < 28) {
-          this.collectPickup(k);
-          k.y = H + 100;
-        }
-      }
-    }
-    this.pickups = this.pickups.filter((k) => k.y < H + 40);
-  }
-
-  private collectPickup(k: Pickup) {
-    const p = this.p;
-    this.sfx.pickup();
-    this.spark(k.x, k.y, '#ffffff', 10, 140);
-    this.rings.push({ x: k.x, y: k.y, r: 6, max: 40, life: 0.3, max_life: 0.3, color: '#ffffff', width: 2 });
-    switch (k.kind) {
-      case 'power':
-        if (p.weapon < 5) {
-          p.weapon++;
-          this.floatText(p.x, p.y - 30, `WAFFE LV ${p.weapon}`, '#ffd166', 15);
-        } else {
-          this.score += 1000;
-          this.floatText(p.x, p.y - 30, '+1000', '#ffd166', 15);
-        }
-        break;
-      case 'shield':
-        p.shield = Math.min(p.shield + 8, 14);
-        this.floatText(p.x, p.y - 30, 'SCHILD', '#4cc9f0', 15);
-        break;
-      case 'health':
-        p.hp = Math.min(p.maxHp, p.hp + 35);
-        this.floatText(p.x, p.y - 30, '+35 HP', '#7CFC9a', 15);
-        break;
-      case 'bomb':
-        if (p.bombs < 5) {
-          p.bombs++;
-          this.floatText(p.x, p.y - 30, '+1 BOMBE', '#ff6b6b', 15);
-        } else {
-          this.score += 500;
-          this.floatText(p.x, p.y - 30, '+500', '#ff6b6b', 15);
-        }
-        break;
-    }
-  }
-
-  private updateEffects(dt: number) {
-    for (const q of this.parts) {
-      q.x += q.vx * dt;
-      q.y += q.vy * dt;
-      q.vx *= 1 - 1.5 * dt;
-      q.vy *= 1 - 1.5 * dt;
-      q.life -= dt;
-    }
-    this.parts = this.parts.filter((q) => q.life > 0);
-    for (const r of this.rings) {
-      r.life -= dt;
-      const t = 1 - Math.max(0, r.life) / r.max_life;
-      r.r = 6 + (r.max - 6) * (1 - Math.pow(1 - t, 2));
-    }
-    this.rings = this.rings.filter((r) => r.life > 0);
-    for (const t of this.texts) {
-      t.y -= 34 * dt;
-      t.life -= dt * 1.1;
-    }
-    this.texts = this.texts.filter((t) => t.life > 0);
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* Rendering                                                           */
-  /* ------------------------------------------------------------------ */
-
-  private render() {
-    const g = this.ctx;
-    g.save();
-    g.clearRect(0, 0, W, H);
-
-    // Hintergrund
-    g.drawImage(this.nebula, 0, this.nebulaY - H);
-    g.drawImage(this.nebula, 0, this.nebulaY);
-    for (const s of this.stars) {
-      const a = 0.35 + 0.65 * s.z * (0.75 + 0.25 * Math.sin(this.clock * 2 + s.tw));
-      g.fillStyle = `rgba(200,220,255,${a})`;
-      const sz = s.z * 2;
-      g.fillRect(s.x, s.y, sz, sz * (1 + s.z * 2));
-    }
-
-    if (this.shake > 0) g.translate(rand(-1, 1) * this.shake * 0.5, rand(-1, 1) * this.shake * 0.5);
-
-    if (this.state !== 'menu') {
-      for (const k of this.pickups) this.drawPickup(k);
-      for (const e of this.enemies) this.drawEnemy(e);
-      if (this.p.alive) this.drawPlayer();
-      this.drawBullets();
-    }
-
-    // Partikel (additiv)
-    g.globalCompositeOperation = 'lighter';
-    for (const q of this.parts) {
-      const a = clamp(q.life / q.max, 0, 1);
-      g.globalAlpha = a;
-      g.fillStyle = q.color;
-      g.beginPath();
-      g.arc(q.x, q.y, q.size * (0.4 + a * 0.6), 0, Math.PI * 2);
-      g.fill();
-    }
-    g.globalAlpha = 1;
-    for (const r of this.rings) {
-      g.globalAlpha = clamp(r.life / r.max_life, 0, 1);
-      g.strokeStyle = r.color;
-      g.lineWidth = r.width * (r.life / r.max_life);
-      g.beginPath();
-      g.arc(r.x, r.y, r.r, 0, Math.PI * 2);
-      g.stroke();
-    }
-    g.globalAlpha = 1;
-    g.globalCompositeOperation = 'source-over';
-
-    for (const t of this.texts) {
-      g.globalAlpha = clamp(t.life, 0, 1);
-      this.text(t.text, t.x, t.y, t.size, t.color, 'center', 700);
-    }
-    g.globalAlpha = 1;
-    g.restore();
-
-    if (this.flash > 0) {
-      g.fillStyle = `rgba(255,240,200,${this.flash * 0.7})`;
-      g.fillRect(0, 0, W, H);
-    }
-    if (this.p && this.p.alive && this.p.hp < 30 && this.state === 'playing') {
-      const a = 0.12 + 0.1 * Math.sin(this.clock * 8);
-      const rg = g.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.75);
-      rg.addColorStop(0, 'rgba(255,0,40,0)');
-      rg.addColorStop(1, `rgba(255,0,40,${a * 2})`);
-      g.fillStyle = rg;
-      g.fillRect(0, 0, W, H);
-    }
-
-    if (this.state === 'playing' || this.state === 'paused' || this.state === 'over') this.drawHud();
-  }
-
-  private text(s: string, x: number, y: number, size: number, color: string, align: CanvasTextAlign = 'left', weight = 600) {
-    const g = this.ctx;
-    g.font = `${weight} ${size}px Orbitron, "Segoe UI", system-ui, sans-serif`;
-    g.textAlign = align;
-    g.textBaseline = 'middle';
-    g.fillStyle = color;
-    g.fillText(s, x, y);
-  }
-
-  private poly(pts: number[][], fill: string, stroke?: string, lw = 1.5) {
-    const g = this.ctx;
-    g.beginPath();
-    g.moveTo(pts[0][0], pts[0][1]);
-    for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
-    g.closePath();
-    g.fillStyle = fill;
-    g.fill();
-    if (stroke) {
-      g.strokeStyle = stroke;
-      g.lineWidth = lw;
-      g.lineJoin = 'round';
-      g.stroke();
-    }
-  }
-
-  private circle(x: number, y: number, r: number, fill: string) {
-    const g = this.ctx;
-    g.beginPath();
-    g.arc(x, y, r, 0, Math.PI * 2);
-    g.fillStyle = fill;
-    g.fill();
-  }
-
-  private drawPlayer() {
-    const g = this.ctx;
-    const p = this.p;
-    if (p.invuln > 0 && p.shield <= 0 && Math.floor(this.clock * 16) % 2 === 0) return;
-    g.save();
-    g.translate(p.x, p.y);
-    // Flamme
-    const fl = 10 + Math.random() * 8;
-    g.globalCompositeOperation = 'lighter';
-    this.poly([[-5, 12], [5, 12], [0, 12 + fl]], 'rgba(255,170,60,0.9)');
-    this.poly([[-2.5, 12], [2.5, 12], [0, 12 + fl * 0.6]], 'rgba(255,255,220,0.95)');
-    g.globalCompositeOperation = 'source-over';
-    // Flügel
-    this.poly([[-7, -4], [-22, 14], [-22, 19], [-9, 13], [-5, 14]], '#3a86ff', '#9ad1ff');
-    this.poly([[7, -4], [22, 14], [22, 19], [9, 13], [5, 14]], '#3a86ff', '#9ad1ff');
-    // Rumpf
-    this.poly([[0, -24], [6, -8], [8, 14], [0, 18], [-8, 14], [-6, -8]], '#eef4ff', '#7cc4ff');
-    // Cockpit
-    const cg = g.createLinearGradient(0, -14, 0, 2);
-    cg.addColorStop(0, '#b8f3ff');
-    cg.addColorStop(1, '#2a7fff');
-    g.beginPath();
-    g.ellipse(0, -6, 3.5, 7, 0, 0, Math.PI * 2);
-    g.fillStyle = cg;
-    g.fill();
-    // Waffenstufe – Kanonen
-    if (p.weapon >= 3) {
-      this.circle(-14, 10, 2.5, '#ffd166');
-      this.circle(14, 10, 2.5, '#ffd166');
-    }
-    if (p.weapon >= 5) {
-      this.circle(-19, 14, 2.5, '#ff6b6b');
-      this.circle(19, 14, 2.5, '#ff6b6b');
-    }
-    // Schild
-    if (p.shield > 0) {
-      const warn = p.shield < 2 && Math.floor(this.clock * 10) % 2 === 0;
-      if (!warn) {
-        const sg = g.createRadialGradient(0, 0, 14, 0, 0, 34);
-        sg.addColorStop(0, 'rgba(76,201,240,0.05)');
-        sg.addColorStop(1, 'rgba(76,201,240,0.45)');
-        g.beginPath();
-        g.arc(0, 0, 34, 0, Math.PI * 2);
-        g.fillStyle = sg;
-        g.fill();
-        g.strokeStyle = 'rgba(160,230,255,0.9)';
-        g.lineWidth = 1.5;
-        g.stroke();
-      }
-    }
-    g.restore();
-  }
-
-  private drawBullets() {
-    const g = this.ctx;
-    // Spieler
-    g.lineCap = 'round';
-    for (const b of this.bullets) {
-      if (b.dead || !b.friendly) continue;
-      g.strokeStyle = b.color;
-      g.lineWidth = 4;
-      g.globalAlpha = 0.35;
-      g.beginPath();
-      g.moveTo(b.x - b.vx * 0.022, b.y - b.vy * 0.022);
-      g.lineTo(b.x, b.y);
-      g.stroke();
-      g.globalAlpha = 1;
-      g.lineWidth = 2;
-      g.beginPath();
-      g.moveTo(b.x - b.vx * 0.016, b.y - b.vy * 0.016);
-      g.lineTo(b.x, b.y);
-      g.stroke();
-    }
-    // Gegner
-    for (const b of this.bullets) {
-      if (b.dead || b.friendly) continue;
-      g.globalAlpha = 0.3;
-      this.circle(b.x, b.y, b.r * 2, b.color);
-      g.globalAlpha = 1;
-      this.circle(b.x, b.y, b.r, b.color);
-      this.circle(b.x, b.y, b.r * 0.5, '#fff');
-    }
-  }
-
-  private drawPickup(k: Pickup) {
-    const g = this.ctx;
-    const info = {
-      power: { c: '#ffb703', l: 'P' },
-      shield: { c: '#4cc9f0', l: 'S' },
-      health: { c: '#52e07c', l: '+' },
-      bomb: { c: '#ff5d73', l: 'B' },
-    }[k.kind];
-    const bob = Math.sin(k.t * 5) * 2;
-    g.save();
-    g.translate(k.x, k.y + bob);
-    g.globalAlpha = 0.3 + 0.15 * Math.sin(k.t * 6);
-    this.circle(0, 0, 22, info.c);
-    g.globalAlpha = 1;
-    this.circle(0, 0, 13, '#0b1030');
-    g.beginPath();
-    g.arc(0, 0, 13, 0, Math.PI * 2);
-    g.strokeStyle = info.c;
-    g.lineWidth = 2.5;
-    g.stroke();
-    this.text(info.l, 0, 1, 15, info.c, 'center', 800);
-    g.restore();
-  }
-
-  private drawEnemy(e: Enemy) {
-    const g = this.ctx;
-    const fl = e.flash > 0;
-    const F = (c: string) => (fl ? '#ffffff' : c);
-    g.save();
-    g.translate(e.x, e.y);
-    const r = e.r;
-    switch (e.kind) {
-      case 'scout':
-        this.poly([[0, r], [r, -r * 0.7], [r * 0.35, -r * 0.35], [0, -r * 0.7], [-r * 0.35, -r * 0.35], [-r, -r * 0.7]], F('#ff4d6d'), '#ffb3c1');
-        this.circle(0, -2, 3.5, F('#ffe5ec'));
-        break;
-      case 'zig':
-        this.poly([[0, r], [r, 0], [r * 0.5, -r], [0, -r * 0.4], [-r * 0.5, -r], [-r, 0]], F('#ffb703'), '#fff1b8');
-        this.circle(0, -1, 4, F('#7a3e00'));
-        break;
-      case 'tank': {
-        const pts: number[][] = [];
-        for (let i = 0; i < 6; i++) {
-          const a = (i / 6) * Math.PI * 2 + Math.PI / 6;
-          pts.push([Math.cos(a) * r, Math.sin(a) * r]);
-        }
-        this.poly(pts, F('#6c7a93'), '#c3cee3', 2);
-        this.poly([[-10, 6], [10, 6], [6, r + 4], [-6, r + 4]], F('#414b5e'), '#9aa7bf');
-        this.circle(0, 0, 9, F('#2b1d2e'));
-        this.circle(0, 0, 5 + Math.sin(this.clock * 6) * 1.2, F('#ff4d6d'));
-        if (e.hp < e.maxHp) this.hpBar(e, -r - 10);
-        break;
-      }
-      case 'kamikaze':
-        g.rotate(e.angle - Math.PI / 2);
-        this.poly([[0, r * 1.2], [r * 0.8, -r * 0.8], [0, -r * 0.3], [-r * 0.8, -r * 0.8]], F('#ff6b00'), '#ffd0a0');
-        this.circle(0, 2, 3, F('#fff3b0'));
-        break;
-      case 'shooter': {
-        g.beginPath();
-        g.arc(0, 0, r, 0, Math.PI * 2);
-        g.fillStyle = F('#7b2cbf');
-        g.fill();
-        g.strokeStyle = '#e0aaff';
-        g.lineWidth = 2;
-        g.stroke();
-        for (let i = -2; i <= 2; i++) {
-          const a = Math.PI / 2 + i * 0.5;
-          this.circle(Math.cos(a) * (r + 2), Math.sin(a) * (r + 2), 3, F('#e0aaff'));
-        }
-        this.circle(0, 0, 7, F('#240046'));
-        this.circle(0, 0, 3.5, F('#ff9e00'));
-        if (e.hp < e.maxHp) this.hpBar(e, -r - 10);
-        break;
-      }
-      case 'boss':
-        this.drawBoss(e, fl);
-        break;
-    }
-    g.restore();
-  }
-
-  private hpBar(e: Enemy, y: number) {
-    const w = e.r * 1.6;
-    this.ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    this.ctx.fillRect(-w / 2, y, w, 4);
-    this.ctx.fillStyle = '#ff4d6d';
-    this.ctx.fillRect(-w / 2, y, w * clamp(e.hp / e.maxHp, 0, 1), 4);
-  }
-
-  private drawBoss(e: Enemy, fl: boolean) {
-    const g = this.ctx;
-    const F = (c: string) => (fl ? '#ffffff' : c);
-    const r = e.r;
-    const pulse = 0.5 + 0.5 * Math.sin(this.clock * (4 + e.phase * 3));
-    const rage = e.phase === 2;
-    if (!e.entered) g.globalAlpha = 0.8;
-    if (e.bossType === 0) {
-      // Wächter
-      this.poly([[-r, -10], [-r * 0.5, -r * 0.8], [r * 0.5, -r * 0.8], [r, -10], [r * 0.7, r * 0.7], [0, r], [-r * 0.7, r * 0.7]], F('#5a189a'), '#c77dff', 3);
-      this.poly([[-r * 1.2, -r * 0.2], [-r, -10], [-r * 0.7, r * 0.7], [-r * 1.1, r * 0.5]], F('#3c096c'), '#9d4edd', 2);
-      this.poly([[r * 1.2, -r * 0.2], [r, -10], [r * 0.7, r * 0.7], [r * 1.1, r * 0.5]], F('#3c096c'), '#9d4edd', 2);
-      this.circle(-r * 0.6, r * 0.55, 6, F('#10002b'));
-      this.circle(r * 0.6, r * 0.55, 6, F('#10002b'));
-      this.circle(0, 0, r * 0.38, F('#10002b'));
-      this.circle(0, 0, r * 0.26 + pulse * 3, F(rage ? '#ff2e63' : '#e0aaff'));
-    } else if (e.bossType === 1) {
-      // Hydra
-      this.poly([[-r, 0], [-r * 0.6, -r * 0.6], [r * 0.6, -r * 0.6], [r, 0], [r * 0.6, r * 0.5], [-r * 0.6, r * 0.5]], F('#0b6e6e'), '#72efdd', 3);
-      for (const ox of [-40, 0, 40]) {
-        this.poly([[ox - 12, r * 0.3], [ox + 12, r * 0.3], [ox + 8, r * 0.9], [ox - 8, r * 0.9]], F('#0a4d4d'), '#72efdd', 2);
-        this.circle(ox, r * 0.85, 5, F('#002b2b'));
-        this.circle(ox, r * 0.85, 2.5 + pulse * 2, F(rage ? '#ff2e63' : '#b8fff2'));
-      }
-      this.circle(0, -4, r * 0.3, F('#002b2b'));
-      this.circle(0, -4, r * 0.18 + pulse * 3, F(rage ? '#ff2e63' : '#72efdd'));
-    } else {
-      // Dreadnought
-      this.poly([[-r * 1.3, r * 0.2], [-r * 0.9, -r * 0.7], [-r * 0.3, -r * 0.9], [r * 0.3, -r * 0.9], [r * 0.9, -r * 0.7], [r * 1.3, r * 0.2], [r * 0.8, r * 0.8], [0, r * 0.6], [-r * 0.8, r * 0.8]], F('#6b4a1e'), '#ffa62b', 3);
-      this.poly([[-r * 0.5, -r * 0.5], [r * 0.5, -r * 0.5], [r * 0.35, r * 0.35], [-r * 0.35, r * 0.35]], F('#3d2a10'), '#d98a1f', 2);
-      for (const ox of [-r * 0.95, r * 0.95]) {
-        this.circle(ox, r * 0.35, 9, F('#2a1a08'));
-        this.circle(ox, r * 0.35, 4.5 + pulse * 2, F(rage ? '#ff2e63' : '#ffd166'));
-      }
-      this.circle(0, -2, r * 0.3, F('#1b1005'));
-      this.circle(0, -2, r * 0.2 + pulse * 3, F(rage ? '#ff2e63' : '#ff9f1c'));
-    }
-    g.globalAlpha = 1;
-  }
-
-  private drawHud() {
-    const g = this.ctx;
-    const p = this.p;
-
-    // Punkte
-    this.text('PUNKTE', 14, 18, 10, '#7f8fb5', 'left', 600);
-    this.text(this.score.toLocaleString('de-DE'), 14, 36, 20, '#ffffff', 'left', 800);
-    this.text(`REKORD ${Math.max(this.best, this.score).toLocaleString('de-DE')}`, 14, 56, 10, '#ffd166', 'left', 600);
-    // Welle
-    this.text(`WELLE ${Math.max(this.wave, 1)}`, W / 2, 20, 13, '#4cc9f0', 'center', 800);
-    if (this.wave % 5 === 4 || this.bossRef) {
-      this.text(this.bossRef ? BOSS_NAMES[this.bossRef.bossType] : 'BOSS VORAUS', W / 2, 38, 10, '#ff4d6d', 'center', 700);
-    }
-    // Kombo
-    if (this.combo >= 3) {
-      const m = this.mult();
-      const s = 1 + Math.min(0.25, this.comboT * 0.05);
-      this.text(`${this.combo} KOMBO`, 14, 78, 12 * s, m > 1 ? '#ffd166' : '#9fb4e0', 'left', 800);
-      if (m > 1) this.text(`x${m}`, 14 + 88, 78, 14, '#ffd166', 'left', 800);
-      g.fillStyle = 'rgba(255,255,255,0.15)';
-      g.fillRect(14, 88, 70, 3);
-      g.fillStyle = '#ffd166';
-      g.fillRect(14, 88, 70 * clamp(this.comboT / 2.6, 0, 1), 3);
-    }
-
-    // Bossleiste
-    const boss = this.bossRef;
-    if (boss && !boss.dead) {
-      const bw = W - 120;
-      const bx = 60;
-      const by = 52;
-      g.fillStyle = 'rgba(0,0,0,0.55)';
-      g.fillRect(bx - 2, by - 2, bw + 4, 12);
-      g.fillStyle = '#3a0d1a';
-      g.fillRect(bx, by, bw, 8);
-      const hg = g.createLinearGradient(bx, 0, bx + bw, 0);
-      hg.addColorStop(0, '#ff4d6d');
-      hg.addColorStop(1, '#ff9e00');
-      g.fillStyle = hg;
-      g.fillRect(bx, by, bw * clamp(boss.hp / boss.maxHp, 0, 1), 8);
-      g.fillStyle = 'rgba(255,255,255,0.4)';
-      g.fillRect(bx + bw * 0.33, by, 1, 8);
-      g.fillRect(bx + bw * 0.66, by, 1, 8);
-    }
-
-    // Lebensleiste
-    const hx = 14;
-    const hy = H - 28;
-    this.text('HÜLLE', hx, hy - 12, 9, '#7f8fb5', 'left', 700);
-    g.fillStyle = 'rgba(0,0,0,0.55)';
-    g.fillRect(hx - 2, hy - 2, 152, 14);
-    g.fillStyle = '#1a2a24';
-    g.fillRect(hx, hy, 148, 10);
-    const hf = clamp(p.hp / p.maxHp, 0, 1);
-    g.fillStyle = hf > 0.5 ? '#52e07c' : hf > 0.25 ? '#ffb703' : '#ff4d6d';
-    g.fillRect(hx, hy, 148 * hf, 10);
-    if (p.shield > 0) {
-      g.fillStyle = 'rgba(0,0,0,0.55)';
-      g.fillRect(hx - 2, hy - 18, 152, 8);
-      g.fillStyle = '#4cc9f0';
-      g.fillRect(hx, hy - 16, 148 * clamp(p.shield / 14, 0, 1), 4);
-    }
-    // Waffenstufe
-    this.text('WAFFE', 180, hy - 12, 9, '#7f8fb5', 'left', 700);
-    for (let i = 0; i < 5; i++) {
-      g.fillStyle = i < p.weapon ? '#ffd166' : 'rgba(255,255,255,0.15)';
-      g.fillRect(180 + i * 15, hy, 12, 10);
-    }
-    // Bomben
-    this.text('BOMBEN', W - 14, hy - 12, 9, '#7f8fb5', 'right', 700);
-    for (let i = 0; i < 5; i++) {
-      const bx = W - 22 - i * 20;
-      g.globalAlpha = i < p.bombs ? 1 : 0.2;
-      this.circle(bx, hy + 5, 7, '#ff5d73');
-      this.circle(bx, hy + 5, 3, '#ffd6dc');
-      g.globalAlpha = 1;
-    }
-
-    // Banner
-    if (this.banner) {
-      const b = this.banner;
-      const t = b.max - b.t;
-      const a = clamp(Math.min(t / 0.3, b.t / 0.4), 0, 1);
-      g.globalAlpha = a;
-      const pulse = b.text === 'WARNUNG' ? 0.6 + 0.4 * Math.abs(Math.sin(this.clock * 8)) : 1;
-      g.globalAlpha = a * pulse;
-      this.text(b.text, W / 2, H * 0.36, 34, b.color, 'center', 900);
-      this.text(b.sub, W / 2, H * 0.36 + 34, 14, '#e6eeff', 'center', 600);
-      g.globalAlpha = 1;
-    }
-  }
+  /** Straßen-Kachel-Test für Tests/Renderer */
+  isRoad(x: number, y: number) { return isRoadTile(this, x, y); }
 }

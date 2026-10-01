@@ -1,15 +1,43 @@
+# Dependencies
 node_modules/
+
+# Next.js / build output
+.next/
+out/
 dist/
+build/
+
+# TypeScript / tooling cache
+*.tsbuildinfo
+.eslintcache
+
+# Local environment and secrets
 .env
 .env.*
 !.env.example
 *.local
+*.pem
+*.key
+
+# Logs and temporary files
 *.log
-*.tsbuildinfo
-.DS_Store
-.vscode/
-.idea/
-coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 .tmp/
 tmp/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Test / coverage output
+coverage/
+playwright-report/
+test-results/
+
+# Local archives and generated packages
 *.zip
