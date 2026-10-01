@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: #03030d;
+  overscroll-behavior: none;
+}
+
+body {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+}
+
+canvas {
+  image-rendering: auto;
+}
