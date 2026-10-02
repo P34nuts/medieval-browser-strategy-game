@@ -32,6 +32,7 @@ import {
 import { assignHomes, assignWorkplaces, releaseResident, syncPopulation, updateResidents } from "./residents";
 import { depositInfo, initDeposits, initialDeposit, updateFields, updateProcessors, updateTrees, treeStage } from "./jobs";
 import { isInstant, materialFraction, siteState, updateConstruction } from "./construction";
+import { advanceComputerPlayers, createPlayers, normalizePlayers, type GamePlayer } from "./players";
 
 const SIM_STEP = 0.5;
 const SOLDIERS_PER_BARRACKS = 10;
@@ -87,6 +88,7 @@ export interface SaveData {
   depositRemaining?: Record<string, number>;
   transportStats?: { delivered: number; cancelled: number; failed: number; goods: number };
   lostGoods?: Record<string, number>;
+  players?: GamePlayer[];
 }
 
 type ResMap = Record<ResId, number>;
@@ -156,6 +158,8 @@ export class GameEngine {
   simulationSpeed: 0 | 1 | 2 = 1;
 
   residents: Resident[] = [];
+  /** Lokale Mehrspieler-Lobby: Spieler 0 ist der Mensch, weitere Spieler sind Computergegner. */
+  players: GamePlayer[] = createPlayers(2);
   nextResidentId = 1;
   transportOrders: TransportOrder[] = [];
   transportArchive: TransportOrder[] = [];
@@ -185,8 +189,9 @@ export class GameEngine {
   /* ================================================================ Erzeugen */
 
   /** Neues Spiel: kleine Siedlung mit Lagerhaus, Straße und zwei Häusern (Eingang zur Straße gedreht) */
-  static newGame(seed: number): GameEngine {
+  static newGame(seed: number, playerCount = 2): GameEngine {
     const g = new GameEngine(seed);
+    g.players = createPlayers(playerCount);
     const c = MAP_SIZE / 2;
     g.addBuilding("warehouse", c - 1, c - 2, true);
     for (let x = c - 3; x <= c + 4; x++) g.addBuilding("road", x, c + 1, true);
@@ -213,6 +218,7 @@ export class GameEngine {
     g.soldiers = Math.max(0, num(data.soldiers, 0));
     g.playTime = Math.max(0, num(data.playTime, 0));
     g.tradeCount = Math.max(0, Math.floor(num(data.tradeCount, 0)));
+    g.players = normalizePlayers(data.players);
     if (data.treeGrowth && typeof data.treeGrowth === "object") for (const [k, v] of Object.entries(data.treeGrowth)) { const i = Number(k), n = Number(v); if (tileOk(i) && Number.isFinite(n)) g.treeGrowth.set(i, Math.max(0, Math.min(3, n))); }
     if (Array.isArray(data.harvestedTrees)) for (const i of data.harvestedTrees) if (tileOk(i) && !g.treeGrowth.has(i)) g.treeGrowth.set(i, 0);
     if (data.treeEmpty && typeof data.treeEmpty === "object") for (const [k, v] of Object.entries(data.treeEmpty)) { const i = Number(k), n = Number(v); if (tileOk(i) && Number.isFinite(n) && g.treeGrowth.get(i) === 0) g.treeEmpty.set(i, Math.max(0, n)); }
@@ -322,6 +328,7 @@ export class GameEngine {
       depositRemaining: Object.fromEntries([...this.depositRemaining].filter(([i, v]) => v !== initialDeposit(this, i))),
       transportStats: this.transportStats,
       lostGoods: this.lostGoods as Record<string, number>,
+      players: this.players,
     };
   }
 
@@ -702,6 +709,7 @@ export class GameEngine {
   private step(dt: number) {
     if (this.dirtyFlag) this.recompute();
     this.physicalClock += dt;
+    advanceComputerPlayers(this.players, dt);
     this.computeStats();
     syncPopulation(this);
     assignHomes(this);

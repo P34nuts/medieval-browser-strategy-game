@@ -82,8 +82,8 @@ export default function GameView({ username, initialSave, onLogout }: { username
     e.toast("Spielstand geladen", "good");
   }, []);
 
-  const newGame = useCallback(() => {
-    const e = GameEngine.newGame(randomSeed());
+  const newGame = useCallback((playerCount = 2) => {
+    const e = GameEngine.newGame(randomSeed(), playerCount);
     setEngine(e);
     setPanelState(null);
     setSaveInfo("Neue Karte erstellt (noch nicht gespeichert).");

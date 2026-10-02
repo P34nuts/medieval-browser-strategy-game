@@ -16,7 +16,7 @@ export interface GameCtx {
   saveInfo: string;
   save: () => Promise<void>;
   load: () => Promise<void>;
-  newGame: () => void;
+  newGame: (playerCount?: number) => void;
   logout: () => void;
 }
 

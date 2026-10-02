@@ -284,6 +284,7 @@ export function MenuModal({ g }: { g: GameCtx }) {
   const e = g.engine;
   useEngine(e);
   const [sure, setSure] = useState(false);
+  const [playerCount, setPlayerCount] = useState(Math.max(2, Math.min(8, e.players.length)));
   const mins = Math.floor(e.playTime / 60);
   return (
     <Modal title="Spielmenü" icon="⚙️" onClose={() => g.setPanel(null)}>
@@ -297,13 +298,32 @@ export function MenuModal({ g }: { g: GameCtx }) {
         <button className="btn h-12 text-base" onClick={() => void g.load()}>📂 Laden</button>
         {sure ? (
           <div className="flex gap-2">
-            <button className="btn btn-danger h-12 flex-1" onClick={() => { setSure(false); g.newGame(); }}>Ja, neue Karte</button>
+            <button className="btn btn-danger h-12 flex-1" onClick={() => { setSure(false); g.newGame(playerCount); }}>Ja, neue Karte</button>
             <button className="btn h-12 flex-1" onClick={() => setSure(false)}>Nein</button>
           </div>
         ) : (
           <button className="btn h-12 text-base" onClick={() => setSure(true)}>🗺️ Neue Karte</button>
         )}
         <button className="btn btn-danger h-12 text-base" onClick={g.logout}>🚪 Abmelden</button>
+      </div>
+
+      <div className="parchment mt-3 p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <span className="font-semibold text-amber-200">🏰 Spieler</span>
+          <label className="flex items-center gap-2 text-sm">
+            <span>Neue Karte</span>
+            <select className="rounded bg-black/40 px-2 py-1 text-amber-100" value={playerCount} onChange={(ev) => setPlayerCount(Number(ev.target.value))}>
+              {Array.from({ length: 7 }, (_, i) => i + 2).map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+        </div>
+        <div className="grid gap-1 sm:grid-cols-2">
+          {e.players.map((p) => <div key={p.id} className="flex items-center justify-between rounded bg-black/20 px-2 py-1 text-sm">
+            <span><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full" style={{ background: p.color }} />{p.name}</span>
+            <span className="text-xs text-amber-100/70">{p.kind === "computer" ? "Computergegner" : "Du"} · {p.score} Punkte</span>
+          </div>)}
+        </div>
+        <p className="mt-2 text-xs text-amber-100/60">Bis zu 8 Spieler. Im Solomodus ist automatisch ein Computergegner dabei.</p>
       </div>
 
       <h3 className="mb-2 mt-5 font-display text-lg text-amber-200">Steuerung</h3>

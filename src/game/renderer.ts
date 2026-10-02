@@ -552,7 +552,10 @@ export class GameRenderer {
     const wx = (b.x - b.y) * HW, wy = (b.x + b.y) * HH;
     const dx = wx - s.ox, dy = wy - s.oy;
     if (b.built) {
-      c.save(); c.translate(wx, wy); c.rotate(b.rotation * Math.PI / 2); c.translate(-wx, -wy); c.drawImage(s.canvas, dx, dy); c.restore();
+      // Die prozeduralen Sprites sind bereits isometrisch gezeichnet. Eine Canvas-Rotation
+      // um den Anker drehte sie bei 180° auf den Kopf und bei 90° seitlich. Die Rotation
+      // bleibt für Footprint, Zugang und Spielstand erhalten; die Darstellung bleibt aufrecht.
+      c.drawImage(s.canvas, dx, dy);
       return;
     }
     // Bauphase: Fundament, wachsendes Gebäude, Gerüst, Fortschrittsbalken
