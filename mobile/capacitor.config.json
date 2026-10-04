@@ -2,9 +2,5 @@
   "appId": "com.p34nuts.burgfried",
   "appName": "Burgfried",
   "webDir": "www",
-  "server": {
-    "url": "https://burgfried.onrender.com",
-    "cleartext": false,
-    "androidScheme": "https"
-  }
+  "androidScheme": "https"
 }
