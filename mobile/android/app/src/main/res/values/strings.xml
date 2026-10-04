@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Burgfried</string>
+    <string name="title_activity_main">Burgfried</string>
+    <string name="package_name">com.p34nuts.burgfried</string>
+    <string name="custom_url_scheme">com.p34nuts.burgfried</string>
+</resources>
